@@ -19,14 +19,34 @@ streamlit run app.py
 
 A browser tab opens with the dashboard. That's it.
 
-> **Optional but recommended — build the fast data file first:**
-> ```bash
-> python scripts/build_parquet.py
-> ```
-> This converts `data/DATA.xlsx` into `data/latest.parquet` (loads ~10× faster)
-> plus two sidecar files (`metadata.csv`, `ticker_map.csv`). The app prefers the
-> parquet automatically and silently falls back to the Excel file if it's absent,
-> so this step is never mandatory.
+## Updating the market data
+
+`DATA.xlsx` is the **source of truth** — it's the only file you edit. The
+`latest.parquet` next to it is a **derived cache** that the app rebuilds
+**automatically** whenever the Excel changes, so the workflow is simply:
+
+1. Replace `data/DATA.xlsx` with your refreshed Bloomberg pull.
+2. Commit & push it (and let Streamlit Cloud redeploy), or just re-run locally.
+
+On the next start the app hashes `DATA.xlsx` (SHA-256), compares it to the hash
+recorded in `latest.parquet.meta.json`, and if they differ — or the parquet is
+missing — it rebuilds the cache from the Excel on the spot, then loads it. If the
+cache can't be built for any reason (e.g. a read-only filesystem), it falls back
+to reading `DATA.xlsx` directly so the dashboard always runs. A content hash is
+used rather than a file timestamp because mtimes are unreliable after a git
+checkout or Cloud redeploy.
+
+You can confirm what happened any time on the **Data Quality** page, which shows
+the source file, the cache status (Fresh / Rebuilt automatically / Fallback to
+Excel), the latest data date, and the row/column counts.
+
+> Running `python scripts/build_parquet.py` is therefore **optional** — it just
+> pre-warms the cache locally and also writes the `metadata.csv` / `ticker_map.csv`
+> inspection sidecars. You never need it for the app to see new data.
+
+> **Tip:** don't commit the derived files. The included `.gitignore` already
+> excludes `latest.parquet`, its `.meta.json`, and the CSV sidecars so that only
+> `DATA.xlsx` travels in version control.
 
 ### Deploying to share a link
 Push the folder to GitHub and point [Streamlit Community Cloud](https://share.streamlit.io)
@@ -110,13 +130,14 @@ rates_monitor/
     tickers.py           # internal-key -> Bloomberg-ticker map + tenor configs
     theme.py             # OFR dark palette, regime/bucket colours, CSS, layout
   data/
-    loader.py            # parquet-preferred load, Excel fallback, get_series
+    loader.py            # hash-based auto-rebuild of the cache, Excel fallback
     transforms.py        # rolling z-score (window/min_periods/clip)
     quality.py           # validate_data / staleness report
-    DATA.xlsx            # raw Bloomberg pull
-    latest.parquet       # generated cleaned cache (build_parquet.py)
-    metadata.csv         # generated per-column coverage profile
-    ticker_map.csv       # generated key -> ticker map
+    DATA.xlsx            # raw Bloomberg pull — SOURCE OF TRUTH (the file you edit)
+    latest.parquet       # derived cache, rebuilt automatically when Excel changes
+    latest.parquet.meta.json  # records source hash + shape for staleness checks
+    metadata.csv         # optional per-column profile (build_parquet.py only)
+    ticker_map.csv       # optional key -> ticker map (build_parquet.py only)
   charts/
     common.py            # auto-scaling y-axis helper + shared chart primitives
     rates.py, funding.py, credit.py, liquidity.py

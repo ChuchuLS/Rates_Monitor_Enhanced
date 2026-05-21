@@ -38,7 +38,10 @@ from config.tickers import (
     TICKERS, REGIME_COUNTRIES, REAL_RATE_TENORS, TENOR_PAIRS,
     INFL_BE_TENORS, INFL_ZCIS_TENORS,
 )
-from data.loader import load_data, date_filter, get_series, data_source_label
+from data.loader import (
+    load_data, date_filter, get_series, data_source_label,
+    source_signature, cache_status_label, load_meta,
+)
 from data.quality import validate_data, quality_summary, STALE_BDAYS
 from charts.common import section_header
 from charts.rates import classify_regime, big_regime_panel, big_curve_panel
@@ -111,13 +114,13 @@ df = load_data()
 
 
 @st.cache_data(show_spinner="Building Composite Liquidity Index...")
-def _build_index(_source: str, n_rows: int):
-    """Compute the index once per data load. Cache key is the source + row count
-    so it recomputes when a refreshed parquet/Excel is dropped in."""
+def _build_index(_source_hash: str):
+    """Compute the index once per data version. Keyed on the DATA.xlsx content
+    hash, so editing the Excel (any change, not just new rows) recomputes it."""
     return compute_index(load_data())
 
 
-index_result = _build_index(data_source_label(), len(df))
+index_result = _build_index(source_signature())
 
 
 # ===========================================================================
@@ -260,6 +263,40 @@ def render_data_quality_page(df: pd.DataFrame) -> None:
     section_header(
         "Data Quality",
         f"Per-ticker coverage check · stale = no obs in last {STALE_BDAYS} business days",
+    )
+
+    # Data-source / cache status (confirms the dashboard is on the latest Excel).
+    meta = load_meta()
+    status = cache_status_label()
+    status_colour = (ACCENT_GREEN if status.startswith(("Fresh", "Rebuilt"))
+                     else ACCENT_AMBER)
+    latest_date = df.index.max().date()
+    n_rows, n_cols = len(df), df.shape[1]
+    src_end = meta.get("end_date") or str(latest_date)
+    st.markdown(
+        f"""
+        <div style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:6px;
+                    padding:0.7rem 0.9rem;margin:0.2rem 0 0.8rem;
+                    display:flex;flex-wrap:wrap;gap:1.6rem;align-items:baseline;">
+          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
+               text-transform:uppercase;">Source file</span><br>
+               <span style="font-size:13px;color:#fff;font-weight:700;">DATA.xlsx</span></div>
+          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
+               text-transform:uppercase;">Parquet cache</span><br>
+               <span style="font-size:13px;color:{status_colour};font-weight:700;">
+               {status}</span></div>
+          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
+               text-transform:uppercase;">Latest data date</span><br>
+               <span style="font-size:13px;color:#fff;font-weight:700;">{latest_date}</span></div>
+          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
+               text-transform:uppercase;">Rows</span><br>
+               <span style="font-size:13px;color:#fff;font-weight:700;">{n_rows:,}</span></div>
+          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
+               text-transform:uppercase;">Columns</span><br>
+               <span style="font-size:13px;color:#fff;font-weight:700;">{n_cols:,}</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
     report = validate_data(df, TICKERS)
     summary = quality_summary(report)
