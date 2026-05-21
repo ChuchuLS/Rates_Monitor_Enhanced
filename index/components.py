@@ -88,6 +88,32 @@ COMPONENTS: list[tuple] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Update-frequency metadata (requirement #6).
+# Several macro series (Fed reserve balances, Fed repo/SRF usage) are published
+# weekly but arrive forward-filled onto a daily grid in the Bloomberg/Excel pull.
+# We record the native frequency so the loader can cap how long a value may
+# persist before it is treated as stale (NaN) rather than a live daily signal.
+# ---------------------------------------------------------------------------
+DEFAULT_FREQUENCY = "daily"
+FREQUENCY: dict[str, str] = {
+    "cb_reserves": "weekly",   # Fed H.4.1 reserve balances (Wednesday)
+    "cb_repo":     "weekly",   # Fed repo / SRF usage (Wednesday)
+    # everything else is daily
+}
+
+# Max business days a value may be carried forward before becoming NaN.
+MAX_FFILL_BY_FREQ = {"daily": 5, "weekly": 10, "monthly": 35, "irregular": 10}
+
+
+def frequency_of(comp_id: str) -> str:
+    return FREQUENCY.get(comp_id, DEFAULT_FREQUENCY)
+
+
+def max_ffill_of(comp_id: str) -> int:
+    return MAX_FFILL_BY_FREQ.get(frequency_of(comp_id), 5)
+
+
 def _build_raw(df: pd.DataFrame, spec: tuple) -> pd.Series:
     """Resolve a builder spec into a raw (un-adjusted) series."""
     kind = spec[0]
@@ -145,6 +171,8 @@ def build_components(df: pd.DataFrame) -> tuple[dict[str, pd.Series], pd.DataFra
                 "direction": direction,
                 "available": available,
                 "n_obs": int(series.shape[0]),
+                "frequency": frequency_of(comp_id),
+                "max_ffill": max_ffill_of(comp_id),
             }
         )
     meta = pd.DataFrame(meta_rows)

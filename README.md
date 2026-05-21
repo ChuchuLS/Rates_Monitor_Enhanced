@@ -99,25 +99,46 @@ spread is tighter; reserves get +1). This single rule makes the whole index
 interpretable.
 
 **3. Z-scoring.** Each adjusted indicator becomes a rolling z-score —
-`window = 1260` (~5y), `min_periods = 504` (~2y), clipped to `[-3, 3]`.
+`window = 1260` (~5y), `min_periods = 504` (~2y), clipped to `[-3, 3]`. A
+**low-variation guard** sets the z-score to NaN whenever the trailing window
+holds fewer than 20 distinct values, so a near-flat series (the classic example
+is EFFR−IORB before 2019, which sat in a ~2bp range) can no longer turn a
+trivial 1bp move into a fake ±3σ "spike". Weekly series (Fed reserves/repo) get
+a **capped forward-fill** so a stale value can't masquerade as a live daily print.
 
 **4. Sub-index & composite.** Each bucket's sub-index is the mean of its
-component z-scores; the composite is the weighted average of the five
-sub-indices. Weights renormalise across whichever buckets have data on a given
-day, so a missing bucket never silently biases the index toward neutral.
+component z-scores, but a bucket only counts on days it has **≥2 live
+components** — a single fragile series is never allowed to *be* a whole bucket.
+The composite is the weighted average over qualifying buckets; weights
+renormalise across whichever buckets have data, and those **effective weights are
+charted over time** so the concentration is transparent.
 
 **5. Scaling.** `liquidity_index = 50 + 10 × composite_z`.
 
-**6. Contribution decomposition.** Each bucket's contribution is built so the
+**6. Coverage gate (when the index is reliable).** A date is only **published**
+if it has **≥3 qualifying buckets** and **≥8 contributing components**, and is
+past the rolling-z warm-up (126 business days after the first computable date).
+Dates that fail are set to NaN — not plotted — and the page labels the early
+span as a *low-coverage / warm-up period*. With the current data this means the
+index is **computable from 2016-05-18 but only reliable/published from
+2019-08-18**, the point at which the SOFR money-market plumbing (SOFR/TGCR/BGCR
+spreads) begins and a third well-populated bucket exists. Before that, the index
+ran on too few components concentrated in single-component buckets, which is what
+produced the 2016–2018 oscillations in the old benchmark overlay.
+
+**7. Contribution decomposition.** Each bucket's contribution is built so the
 terms sum *exactly* to `index − 50`, and so each bucket's change over any
 horizon sums exactly to the index change. That's what powers the "why is
 liquidity moving" attribution on the homepage — a positive contribution eased
 liquidity, a negative one tightened it.
 
-**7. Validation.** The index is compared against Bloomberg FCI / Chicago Fed
+**8. Validation.** The index is compared against Bloomberg FCI / Chicago Fed
 NFCI via a correlation table, rolling 1y correlation, a crisis-window check
 (Sep-2019 repo, COVID, 2022 QT, Mar-2023 banks — the index correctly dips into
-Tight/Stress in each), and a lead-lag cross-correlation.
+Tight/Stress in each), and a lead-lag cross-correlation. The benchmark overlay
+standardises over the published window only, and offers a Raw/Smoothed toggle
+(smoothing is visual-only and never feeds the index). Run
+`python scripts/diagnose_spikes.py` to reproduce the coverage/spike diagnostic.
 
 ---
 

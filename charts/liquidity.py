@@ -34,6 +34,7 @@ from charts.common import autoscale_range, section_header
 from index.components import BUCKETS
 from index.composite import (
     IndexResult, HORIZONS, INDEX_CENTER, regime_label,
+    MIN_AVAILABLE_BUCKETS, MIN_AVAILABLE_COMPONENTS, MIN_COMPONENTS_PER_BUCKET,
 )
 from index.validation import (
     BENCHMARKS, correlation_table, rolling_correlation,
@@ -365,6 +366,87 @@ def lead_lag_chart(ll: pd.Series, benchmark: str, height: int = 300) -> go.Figur
     return fig
 
 
+def coverage_chart(components: pd.Series, buckets: pd.Series,
+                   first_published, height: int = 280) -> go.Figure:
+    """Available components (left axis) and qualifying buckets (right axis) over
+    time, with the reliable-from line marked."""
+    fig = go.Figure()
+    c = components.dropna()
+    b = buckets.dropna()
+    fig.add_trace(go.Scatter(
+        x=c.index, y=c.values, mode="lines", name="Components",
+        line=dict(color=ACCENT_CYAN, width=1.3),
+        hovertemplate="%{x|%Y-%m-%d}: %{y} components<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=b.index, y=b.values, mode="lines", name="Qualifying buckets",
+        line=dict(color=ACCENT_AMBER, width=1.3), yaxis="y2",
+        hovertemplate="%{x|%Y-%m-%d}: %{y} buckets<extra></extra>"))
+    if first_published is not None:
+        fp_str = pd.Timestamp(first_published).strftime("%Y-%m-%d")
+        fig.add_shape(type="line", x0=fp_str, x1=fp_str, y0=0, y1=1, yref="paper",
+                      line=dict(color=POS_GREEN, width=1, dash="dash"))
+        fig.add_annotation(x=fp_str, y=1.0, yref="paper", yanchor="bottom",
+                           text="reliable from", showarrow=False,
+                           font=dict(size=9, color=POS_GREEN))
+    fig.update_layout(
+        **{**DARK_LAYOUT, "showlegend": True}, height=height,
+        margin=dict(l=45, r=45, t=20, b=35),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.32, xanchor="left", x=0,
+                    bgcolor="rgba(0,0,0,0)", font=dict(size=10, color="#ccc")),
+        yaxis2=dict(overlaying="y", side="right", showgrid=False, range=[0, 5.5],
+                    tickfont=dict(size=10, color=ACCENT_AMBER),
+                    title=dict(text="buckets", font=dict(size=9, color=ACCENT_AMBER))),
+    )
+    fig.update_xaxes(showgrid=False, tickfont=dict(size=10, color="#bbb"), linecolor="#222")
+    fig.update_yaxes(showgrid=True, gridcolor=GRID, zeroline=False,
+                     tickfont=dict(size=10, color=ACCENT_CYAN), linecolor="#222",
+                     title=dict(text="components", font=dict(size=9, color=ACCENT_CYAN)))
+    return fig
+
+
+def effective_weights_chart(eff: pd.DataFrame, height: int = 280) -> go.Figure:
+    """Stacked area of the renormalised bucket weights actually used each day."""
+    fig = go.Figure()
+    eff = eff.dropna(how="all")
+    for bucket in _BUCKET_ORDER:
+        if bucket not in eff.columns:
+            continue
+        s = (eff[bucket].fillna(0) * 100)
+        fig.add_trace(go.Scatter(
+            x=s.index, y=s.values, mode="lines", name=BUCKETS[bucket]["label"],
+            line=dict(width=0.5, color=BUCKET_COLORS.get(bucket, LINE_WHITE)),
+            stackgroup="w", fillcolor=BUCKET_COLORS.get(bucket, LINE_WHITE),
+            hovertemplate=(f"{BUCKETS[bucket]['label']}<br>"
+                           "%{x|%Y-%m-%d}: %{y:.0f}%<extra></extra>")))
+    fig.update_layout(
+        **{**DARK_LAYOUT, "showlegend": True}, height=height,
+        margin=dict(l=45, r=20, t=20, b=35),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.32, xanchor="left", x=0,
+                    bgcolor="rgba(0,0,0,0)", font=dict(size=10, color="#ccc")),
+    )
+    fig.update_xaxes(showgrid=False, tickfont=dict(size=10, color="#bbb"), linecolor="#222")
+    fig.update_yaxes(showgrid=True, gridcolor=GRID, zeroline=False, range=[0, 100],
+                     ticksuffix="%", tickfont=dict(size=10, color="#bbb"), linecolor="#222",
+                     title=dict(text="effective weight", font=dict(size=9, color="#888")))
+    return fig
+
+
+def raw_index_chart(index: pd.Series, smooth: int = 1, height: int = 360) -> go.Figure:
+    """The published 50-centred index itself (optionally smoothed for display)."""
+    s = index.dropna()
+    if smooth and smooth > 1:
+        s = s.rolling(smooth, min_periods=1).mean()
+    fig = index_line_chart(s, height=height)
+    return fig
+
+
+def _smooth(s: pd.Series, window: int) -> pd.Series:
+    """Visual-only moving average. Never feeds back into the index calculation."""
+    if window and window > 1:
+        return s.rolling(window, min_periods=1).mean()
+    return s
+
+
 # ===========================================================================
 # Full page renderer (requirement #9-#11)
 # ===========================================================================
@@ -385,12 +467,24 @@ def render_index_page(df: pd.DataFrame, dff: pd.DataFrame, result: IndexResult) 
 
     # --- Index level + regime line ----------------------------------------
     start, end = (dff.index.min(), dff.index.max()) if len(dff) else (df.index.min(), df.index.max())
+
+    # Warn if the chosen lookback reaches into the unpublished low-coverage era.
+    fp = result.first_published_date
+    if fp is not None and start < fp:
+        st.warning(
+            f"The selected lookback starts {start.date()}, but the index is only "
+            f"published from **{fp.date()}** — earlier dates fail the minimum "
+            f"coverage rules (too few buckets / single-component buckets) and are "
+            f"left blank. See *Coverage & reliability* below."
+        )
+
     idx_window = result.index.loc[(result.index.index >= start) & (result.index.index <= end)]
     st.plotly_chart(index_line_chart(idx_window), use_container_width=True,
                     key="liq_index_line", config={"displayModeBar": False})
+    fp_txt = f" · reliable from {fp.date()}" if fp is not None else ""
     st.caption(
         "Bands: green = Loose (≥60) · grey = Neutral (45–60) · "
-        "amber = Tight (35–45) · red = Stress (<35)."
+        "amber = Tight (35–45) · red = Stress (<35)." + fp_txt
     )
 
     # --- Sub-indices + contribution decomposition -------------------------
@@ -425,11 +519,73 @@ def render_index_page(df: pd.DataFrame, dff: pd.DataFrame, result: IndexResult) 
     # Explain the decomposition in words (requirement #10).
     _render_driver_note(result, horizon)
 
+    # --- Coverage & reliability diagnostic (requirements #1, #2, #7) ------
+    _render_coverage_block(result)
+
     # --- Benchmark comparison (requirement #11) ---------------------------
     _render_benchmark_block(df, result)
 
     # --- Component availability + methodology -----------------------------
     _render_components_table(result)
+    _render_methodology(result)
+
+
+def _render_coverage_block(result: IndexResult) -> None:
+    """Show how many components/buckets feed the index over time + effective
+    weights, making partial-coverage periods obvious (requirements #1, #7)."""
+    st.markdown(
+        "<div style='border-top:1px solid #1a1a1a;margin-top:1rem;padding-top:0.6rem;'>"
+        "<div style='font-size:14px;font-weight:700;letter-spacing:0.06em;color:#fff;"
+        "text-transform:uppercase;'>Coverage &amp; reliability</div>"
+        "<div style='font-size:10px;color:#888;letter-spacing:0.08em;"
+        "text-transform:uppercase;margin-top:2px;'>How much of the component "
+        "universe actually feeds the index each day</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    fp = result.first_published_date
+    fv = result.first_valid_date
+    if fp is not None:
+        st.markdown(
+            f"""
+            <div style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:6px;
+                        padding:0.6rem 0.9rem;margin:0.3rem 0 0.6rem;font-size:12px;
+                        color:#ccc;line-height:1.6;">
+              The index is computable from <b>{fv.date() if fv is not None else '—'}</b>
+              (once ~2y of history exists for the first indicators) but is only
+              <b style="color:{POS_GREEN};">published from {fp.date()}</b>, when at
+              least {MIN_AVAILABLE_BUCKETS} buckets — each with ≥
+              {MIN_COMPONENTS_PER_BUCKET} live components — and ≥
+              {MIN_AVAILABLE_COMPONENTS} components are available. Earlier dates are a
+              <b>low-coverage / warm-up period</b> and are not shown as a valid signal.
+            </div>
+            """,
+            unsafe_allow_html=True)
+
+    c_left, c_right = st.columns(2, gap="medium")
+    with c_left:
+        st.markdown(
+            "<div style='color:#888;font-size:11px;letter-spacing:0.08em;"
+            "text-transform:uppercase;margin:0.3rem 0 0.2rem;'>Components &amp; "
+            "buckets available over time</div>", unsafe_allow_html=True)
+        st.plotly_chart(
+            coverage_chart(result.available_component_count,
+                           result.available_bucket_count, fp),
+            use_container_width=True, key="liq_coverage",
+            config={"displayModeBar": False})
+    with c_right:
+        st.markdown(
+            "<div style='color:#888;font-size:11px;letter-spacing:0.08em;"
+            "text-transform:uppercase;margin:0.3rem 0 0.2rem;'>Effective bucket "
+            "weights over time (renormalised)</div>", unsafe_allow_html=True)
+        st.plotly_chart(effective_weights_chart(result.effective_weights),
+                        use_container_width=True, key="liq_effweights",
+                        config={"displayModeBar": False})
+    st.caption(
+        "When a bucket is missing, its weight is spread across the remaining "
+        "buckets — so before XCCY data begins (mid-2022) the other buckets carry "
+        "more. The index is only published once coverage is broad enough that this "
+        "renormalisation no longer rests on one or two fragile series.")
 
 
 def _render_driver_note(result: IndexResult, horizon: str) -> None:
@@ -488,14 +644,43 @@ def _render_benchmark_block(df: pd.DataFrame, result: IndexResult) -> None:
         )
         return
 
-    # Standardised overlay.
+    # Display controls: Raw vs Smoothed (visual only — never changes the index).
+    ctrl, _sp = st.columns([1.1, 2], gap="small")
+    with ctrl:
+        mode = st.radio("DISPLAY", ["Smoothed (5d)", "Raw"], index=0, horizontal=True,
+                        key="liq_overlay_mode",
+                        help="Smoothing is for readability only. The underlying "
+                             "index, correlations and crisis stats always use the raw "
+                             "(unsmoothed) values.")
+    smooth_win = 5 if mode.startswith("Smoothed") else 1
+
+    # (a) The published 50-centred index itself, with regime bands.
+    st.markdown(
+        "<div style='color:#888;font-size:11px;letter-spacing:0.08em;"
+        "text-transform:uppercase;margin:0.4rem 0 0.2rem;'>Liquidity index "
+        "(50-centred, higher = looser)</div>", unsafe_allow_html=True)
+    st.plotly_chart(raw_index_chart(result.index, smooth=smooth_win, height=320),
+                    use_container_width=True, key="liq_raw50",
+                    config={"displayModeBar": False})
+
+    # (b) Standardised overlay vs benchmarks (index smoothed for display only).
     st.markdown(
         "<div style='color:#888;font-size:11px;letter-spacing:0.08em;"
         "text-transform:uppercase;margin:0.5rem 0 0.2rem;'>Standardised overlay "
         "(all oriented so higher = looser)</div>", unsafe_allow_html=True)
-    st.plotly_chart(benchmark_overlay_chart(standardized_overlay(result.index, df)),
+    overlay = standardized_overlay(result.index, df)
+    if smooth_win > 1 and "Liquidity Index" in overlay.columns:
+        overlay = overlay.copy()
+        overlay["Liquidity Index"] = _smooth(overlay["Liquidity Index"], smooth_win)
+    st.plotly_chart(benchmark_overlay_chart(overlay),
                     use_container_width=True, key="liq_overlay",
                     config={"displayModeBar": False})
+    if result.first_published_date is not None:
+        st.caption(
+            f"Overlay covers the published period (from "
+            f"{result.first_published_date.date()}); the low-coverage warm-up era "
+            f"is excluded so it no longer distorts the standardisation. Smoothing "
+            f"is visual only.")
 
     # Correlation table + crisis behaviour side by side.
     tbl_col, crisis_col = st.columns(2, gap="medium")
@@ -575,17 +760,55 @@ def _render_components_table(result: IndexResult) -> None:
     meta["available"] = meta["available"].map({True: "✓", False: "—"})
     meta["weight"] = meta["bucket"].map(lambda b: f"{result.weights.get(b, 0) * 100:.0f}%"
                                         if b in result.weights.index else "—")
-    disp = meta[["bucket_label", "label", "direction", "available", "n_obs", "weight"]]
+    disp = meta[["bucket_label", "label", "direction", "frequency", "available", "n_obs", "weight"]]
     disp = disp.rename(columns={
         "bucket_label": "Bucket", "label": "Indicator", "direction": "Direction",
-        "available": "In index", "n_obs": "Obs", "weight": "Bucket wt"})
+        "frequency": "Freq", "available": "In index", "n_obs": "Obs", "weight": "Bucket wt"})
     st.dataframe(
         disp.style.format({"Obs": "{:,}"}), hide_index=True, use_container_width=True,
         height=min(560, 42 + 36 * len(disp)))
     st.caption(
         "Each indicator is direction-adjusted so higher = looser, then converted "
-        "to a rolling z-score (5y window, 2y min, clipped ±3). Bucket sub-index = "
-        "mean of its z-scores; composite = weighted average (money-market 30%, "
-        "XCCY 20%, credit 20%, central-bank 20%, market-liq 10%), rescaled as "
-        "50 + 10 × composite-z. Weights renormalise across whichever buckets have "
-        "data, so a missing bucket never biases the index.")
+        "to a rolling z-score (5y window, 2y min, clipped ±3, with a low-variation "
+        "guard). A bucket sub-index is the mean of its z-scores, but only counts on "
+        f"days it has ≥ {MIN_COMPONENTS_PER_BUCKET} live components; the composite is "
+        "the weight-renormalised average. Weekly series (Fed reserves/repo) are "
+        "forward-fill-capped so a stale value can't masquerade as a live daily print.")
+
+
+def _render_methodology(result: IndexResult) -> None:
+    """Plain-maths explanation block (requirement #9)."""
+    with st.expander("Methodology — how the index is calculated", expanded=False):
+        st.markdown(
+            r"""
+**1. Direction adjustment** — each raw indicator is signed so higher = looser:
+$\;\text{adj}_{i,t} = \text{raw}_{i,t}\times \text{direction}_i$.
+
+**2. Rolling z-score** (per indicator):
+$\;z_{i,t} = \dfrac{\text{adj}_{i,t}-\mu_{i,t}}{\sigma_{i,t}}$, where $\mu,\sigma$
+are the trailing **5y** mean/std (min **2y**), clipped to $[-3,3]$. A
+**low-variation guard** sets $z$ to NaN when the trailing window holds too few
+distinct values, so a near-flat series (e.g. EFFR−IORB pre-2019) can't produce
+fake ±3σ spikes.
+
+**3. Bucket sub-index** — average of the available z-scores in the bucket,
+*only* on days the bucket has at least 2 live components:
+$\;\text{bucket}_{b,t} = \operatorname{mean}_i\{z_{i,t}: i\in b\}$.
+
+**4. Weighted composite** — renormalised over the buckets available that day:
+$\;\text{composite}_t = \sum_b \tilde{w}_{b,t}\,\text{bucket}_{b,t}$,
+with $\sum_b \tilde{w}_{b,t}=1$ (effective weights shown above).
+
+**5. Final index** — $\;\text{liquidity}_t = 50 + 10\times\text{composite}_t$.
+
+**6. Coverage gate** — a date is published only with ≥ 3 qualifying buckets and
+≥ 8 contributing components, past the rolling-z warm-up; otherwise it is NaN.
+
+**Interpretation** — 50 = neutral · >50 looser than normal · <50 tighter ·
+≥ 60 loose · ≤ 40 tight · ≤ 30 stress.
+
+**Benchmarks** — Bloomberg US FCI and Chicago Fed NFCI are **never inputs**;
+they are used only to validate the index (correlation, crisis behaviour,
+lead-lag).
+            """
+        )

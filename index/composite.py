@@ -3,52 +3,65 @@ index/composite.py
 ==================
 Constructs the Composite Liquidity Index from the raw components.
 
-Pipeline (requirements #7-#10)
-------------------------------
+Pipeline
+--------
 1. For each component: multiply by its direction (looser = higher), then take a
-   rolling z-score  ->  ``z_scores`` frame.
-2. Sub-index per bucket = mean of that bucket's available component z-scores.
-3. Composite z = weighted average of the five sub-indices. Weights are
-   renormalised across whichever buckets have data on a given day, so a missing
-   bucket never silently biases the index toward zero.
-4. Rescale to the interpretable 0-100-ish scale:
-        liquidity_index = 50 + 10 * composite_z
-   => 50 neutral, >50 looser than normal, <50 tighter than normal.
-5. Regime label, period changes, and an additive contribution decomposition so
-   we can explain *why* liquidity is easing or tightening, not just the number.
-
-The contribution maths is built so the per-bucket terms sum *exactly* to
-(index - 50). That means the 1m change of the index equals the sum of the 1m
-changes of the bucket contributions — the decomposition always reconciles.
+   rolling z-score (with a low-variation guard) -> ``z_scores`` frame.
+2. Sub-index per bucket = mean of that bucket's available component z-scores,
+   but ONLY on days the bucket has at least ``min_per_bucket`` live components.
+   (A single fragile series must not *be* a bucket — that was the source of the
+   2016-2018 spikes, when money-market = EFFR-IORB alone.)
+3. Composite z = weighted average of the sub-indices, with weights renormalised
+   across whichever buckets qualify that day. The renormalised (effective)
+   weights are exposed so the concentration is transparent.
+4. Rescale: ``liquidity_index = 50 + 10 * composite_z`` (50 neutral).
+5. COVERAGE GATE: a date is only PUBLISHED if it has >= ``min_buckets``
+   qualifying buckets and >= ``min_components`` contributing components, and is
+   past the rolling-z warm-up. Dates failing the gate are set to NaN in the
+   published ``index`` (the unmasked ``raw_index`` is retained for diagnostics).
+6. Regime label, period changes, and an additive bucket contribution
+   decomposition (terms sum exactly to index-50, so the decomposition always
+   reconciles).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
-from data.transforms import rolling_zscore, Z_WINDOW, Z_MIN_PERIODS, Z_CLIP
-from index.components import BUCKETS, DIRECTION, BUCKET_OF, build_components
+from data.transforms import (
+    rolling_zscore, Z_WINDOW, Z_MIN_PERIODS, Z_CLIP, Z_MIN_UNIQUE,
+)
+from index.components import (
+    BUCKETS, DIRECTION, BUCKET_OF, build_components, max_ffill_of,
+)
 
-# Index scaling constants (requirement #8)
+# Index scaling
 INDEX_CENTER = 50.0
 INDEX_SCALE = 10.0
 
-# Regime thresholds (requirement #9). Higher = looser.
-#   index >= 60  -> Loose
-#   45 <= index < 60 -> Neutral
-#   35 <= index < 45 -> Tight
-#   index < 35  -> Stress
+# Regime thresholds. Higher = looser.
 REGIME_THRESHOLDS = [(60.0, "Loose"), (45.0, "Neutral"), (35.0, "Tight")]
 
-# Period look-backs in business days for the headline changes (requirement #9)
+# Headline change horizons in business days
 HORIZONS = {"1w": 5, "1m": 21, "3m": 63}
+
+# -------------------- Coverage / reliability rules --------------------------
+# A bucket needs at least this many live components before its sub-index counts.
+# Stops a lone, possibly-flat series from carrying a full bucket weight.
+MIN_COMPONENTS_PER_BUCKET = 2
+# A date is only published if at least this many buckets qualify ...
+MIN_AVAILABLE_BUCKETS = 3
+# ... and at least this many components (within qualifying buckets) contribute.
+MIN_AVAILABLE_COMPONENTS = 8
+# After the index first becomes computable, skip this many business days so the
+# rolling z-scores are past their warm-up before we publish.
+WARMUP_DAYS_AFTER_FIRST_VALID = 126
 
 
 def regime_label(value: float) -> str:
-    """Map an index level to a regime label."""
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return "n/a"
     for cutoff, label in REGIME_THRESHOLDS:
@@ -60,15 +73,24 @@ def regime_label(value: float) -> str:
 @dataclass
 class IndexResult:
     """Everything the dashboard needs to render the index, in one object."""
-    index: pd.Series             # final 0-100-ish liquidity index
-    composite_z: pd.Series       # raw weighted-average z (index = 50 + 10*z)
-    sub_indices: pd.DataFrame    # date x bucket sub-index z-scores
+    index: pd.Series             # PUBLISHED 50-centred index (low-coverage -> NaN)
+    raw_index: pd.Series         # index before the coverage/warm-up mask (diagnostics)
+    composite_z: pd.Series       # weighted-average z (raw_index = 50 + 10*z)
+    sub_indices: pd.DataFrame    # date x bucket sub-index z-scores (min_per_bucket applied)
     z_scores: pd.DataFrame       # date x component direction-adjusted z-scores
-    bucket_terms: pd.DataFrame   # date x bucket additive contributions to (index-50)
-    weights: pd.Series           # bucket weights actually used
+    bucket_terms: pd.DataFrame   # date x bucket additive contributions to (raw_index-50)
+    weights: pd.Series           # base bucket weights (normalised over buckets seen)
+    effective_weights: pd.DataFrame  # date x bucket renormalised weights actually used
+    components_by_bucket: pd.DataFrame  # date x bucket live-component counts
+    available_component_count: pd.Series  # contributing components per day
+    available_bucket_count: pd.Series     # qualifying buckets per day
+    coverage_ok: pd.Series       # bool: meets min bucket/component rules
+    published_mask: pd.Series    # bool: coverage_ok AND past warm-up
     meta: pd.DataFrame           # per-component availability metadata
+    first_valid_date: pd.Timestamp | None = None      # first computable date
+    first_published_date: pd.Timestamp | None = None  # first reliable/published date
 
-    # ------- convenience accessors -------------------------------------
+    # ------- convenience accessors (operate on the PUBLISHED index) ----------
     @property
     def latest(self) -> float:
         return float(self.index.dropna().iloc[-1]) if self.index.notna().any() else float("nan")
@@ -78,7 +100,6 @@ class IndexResult:
         return regime_label(self.latest)
 
     def changes(self) -> dict[str, float]:
-        """Index point change over each headline horizon."""
         s = self.index.dropna()
         out = {}
         for name, n in HORIZONS.items():
@@ -86,14 +107,10 @@ class IndexResult:
         return out
 
     def level_contributions(self) -> pd.Series:
-        """Latest contribution of each bucket to (index - 50), in index points."""
-        return self.bucket_terms.dropna(how="all").iloc[-1]
+        terms = self.bucket_terms.dropna(how="all")
+        return terms.iloc[-1] if len(terms) else pd.Series(dtype=float)
 
     def change_contributions(self, horizon: str = "1m") -> pd.Series:
-        """Each bucket's contribution to the index change over ``horizon``.
-
-        Sums exactly to the index change over the same window.
-        """
         n = HORIZONS[horizon]
         terms = self.bucket_terms.dropna(how="all")
         if len(terms) <= n:
@@ -101,19 +118,19 @@ class IndexResult:
         return terms.iloc[-1] - terms.iloc[-1 - n]
 
     def drivers(self, horizon: str = "1m") -> tuple[str, str]:
-        """(main_easing_bucket_label, main_tightening_bucket_label) for horizon.
-
-        Easing  = most positive contribution to the change (pushes index up).
-        Tighten = most negative contribution to the change (pushes index down).
-        """
         contrib = self.change_contributions(horizon)
         if contrib.empty or contrib.isna().all():
             return ("n/a", "n/a")
-        easing = contrib.idxmax()
-        tightening = contrib.idxmin()
-        easing_lbl = BUCKETS.get(easing, {}).get("label", easing)
-        tight_lbl = BUCKETS.get(tightening, {}).get("label", tightening)
+        easing_lbl = BUCKETS.get(contrib.idxmax(), {}).get("label", contrib.idxmax())
+        tight_lbl = BUCKETS.get(contrib.idxmin(), {}).get("label", contrib.idxmin())
         return (easing_lbl, tight_lbl)
+
+    def coverage_frame(self) -> pd.DataFrame:
+        """Tidy frame for the coverage diagnostic chart."""
+        return pd.DataFrame({
+            "components": self.available_component_count,
+            "buckets": self.available_bucket_count,
+        })
 
 
 def compute_index(
@@ -122,60 +139,113 @@ def compute_index(
     z_window: int = Z_WINDOW,
     z_min_periods: int = Z_MIN_PERIODS,
     z_clip: float = Z_CLIP,
+    z_min_unique: int | None = Z_MIN_UNIQUE,
+    min_per_bucket: int = MIN_COMPONENTS_PER_BUCKET,
+    min_buckets: int = MIN_AVAILABLE_BUCKETS,
+    min_components: int = MIN_AVAILABLE_COMPONENTS,
+    warmup_days: int = WARMUP_DAYS_AFTER_FIRST_VALID,
 ) -> IndexResult:
     """Build the Composite Liquidity Index from the price panel."""
     # 1. Raw components + availability metadata.
     raw, meta = build_components(df)
 
-    # 2. Direction-adjust then z-score each available component.
+    # 2. Direction-adjust then z-score each available component, with a
+    #    per-component forward-fill cap based on its native frequency.
     z_cols: dict[str, pd.Series] = {}
     for comp_id, series in raw.items():
-        adjusted = series * DIRECTION[comp_id]   # looser = higher (requirement #7)
+        adjusted = series * DIRECTION[comp_id]   # looser = higher
         z_cols[comp_id] = rolling_zscore(
-            adjusted, window=z_window, min_periods=z_min_periods, clip=z_clip
+            adjusted, window=z_window, min_periods=z_min_periods, clip=z_clip,
+            min_unique=z_min_unique, max_ffill=max_ffill_of(comp_id),
         )
     z_scores = pd.DataFrame(z_cols).sort_index() if z_cols else pd.DataFrame()
 
-    # 3. Sub-index per bucket = mean of available component z-scores.
+    if z_scores.empty:
+        empty = pd.Series(dtype=float)
+        empty_df = pd.DataFrame()
+        return IndexResult(empty, empty, empty, empty_df, z_scores, empty_df,
+                           pd.Series(dtype=float), empty_df, empty_df, empty,
+                           empty, empty, empty, meta)
+
+    # 3. Per-bucket live-component counts and sub-index (with min_per_bucket).
     sub_data: dict[str, pd.Series] = {}
+    count_data: dict[str, pd.Series] = {}
     for bucket in BUCKETS:
         members = [c for c in z_scores.columns if BUCKET_OF[c] == bucket]
-        if members:
-            sub_data[bucket] = z_scores[members].mean(axis=1, skipna=True)
+        if not members:
+            count_data[bucket] = pd.Series(0, index=z_scores.index)
+            continue
+        member_z = z_scores[members]
+        cnt = member_z.notna().sum(axis=1)
+        count_data[bucket] = cnt
+        # Sub-index only on days the bucket has >= min_per_bucket live components.
+        sub_data[bucket] = member_z.mean(axis=1, skipna=True).where(cnt >= min_per_bucket)
+    components_by_bucket = pd.DataFrame(count_data).sort_index()
     sub_indices = pd.DataFrame(sub_data).sort_index() if sub_data else pd.DataFrame()
 
-    # 4. Weighted composite with per-row weight renormalisation.
+    # 4. Weighted composite with per-row weight renormalisation over QUALIFYING
+    #    buckets (those with a non-NaN sub-index that day).
     base_weights = {b: BUCKETS[b]["weight"] for b in BUCKETS}
     if weights:
         base_weights.update(weights)
     w = pd.Series(base_weights)
-    # Keep only buckets that actually produced a sub-index.
     w = w[[b for b in w.index if b in sub_indices.columns]]
-    w = w / w.sum() if w.sum() else w  # normalise the supplied weights to 1.0
+    w = w / w.sum() if w.sum() else w
 
-    if sub_indices.empty:
-        empty = pd.Series(dtype=float)
-        return IndexResult(empty, empty, sub_indices, z_scores,
-                           pd.DataFrame(), w, meta)
-
-    avail = sub_indices[w.index].notna()
-    # Per-row sum of weights over buckets that have data that day.
+    avail = sub_indices[w.index].notna()                 # qualifying buckets per day
     row_w = avail.mul(w, axis=1).sum(axis=1).replace(0.0, np.nan)
-    # Additive bucket terms: 10 * weight_b * sub_b / row_w. NaN where bucket
-    # missing that day, and excluded from the renormalised denominator.
-    weighted = sub_indices[w.index].mul(w, axis=1)
-    bucket_terms = INDEX_SCALE * weighted.div(row_w, axis=0)
+    effective_weights = avail.mul(w, axis=1).div(row_w, axis=0)   # rows sum to 1.0
 
-    # Composite z and final index.
-    index = INDEX_CENTER + bucket_terms.sum(axis=1, min_count=1)
-    composite_z = (index - INDEX_CENTER) / INDEX_SCALE
+    # Additive bucket terms: 10 * eff_weight_b * sub_b. Sum -> raw_index - 50.
+    bucket_terms = INDEX_SCALE * sub_indices[w.index].mul(effective_weights)
+    raw_index = INDEX_CENTER + bucket_terms.sum(axis=1, min_count=1)
+    composite_z = (raw_index - INDEX_CENTER) / INDEX_SCALE
+
+    # 5. Coverage diagnostics + publication gate.
+    available_bucket_count = avail.sum(axis=1)
+    # Components that actually contribute = those in qualifying buckets.
+    contributing = pd.Series(0, index=z_scores.index)
+    for bucket in avail.columns:
+        members = [c for c in z_scores.columns if BUCKET_OF[c] == bucket]
+        if members:
+            contributing = contributing.add(
+                z_scores[members].notna().sum(axis=1).where(avail[bucket], 0),
+                fill_value=0)
+    available_component_count = contributing.astype(int)
+
+    coverage_ok = (available_bucket_count >= min_buckets) & \
+                  (available_component_count >= min_components)
+
+    # Warm-up: skip the first warmup_days business days after the index is first
+    # computable, so the rolling z-scores are mature before we publish.
+    computable = raw_index.notna()
+    first_valid_date = raw_index.index[computable.argmax()] if computable.any() else None
+    if first_valid_date is not None and warmup_days > 0:
+        warmup_cutoff = first_valid_date + pd.tseries.offsets.BusinessDay(warmup_days)
+        warmup_ok = pd.Series(raw_index.index >= warmup_cutoff, index=raw_index.index)
+    else:
+        warmup_ok = pd.Series(True, index=raw_index.index)
+
+    published_mask = coverage_ok.reindex(raw_index.index, fill_value=False) & warmup_ok
+    index = raw_index.where(published_mask)
+    published = index.dropna()
+    first_published_date = published.index[0] if len(published) else None
 
     return IndexResult(
         index=index,
+        raw_index=raw_index,
         composite_z=composite_z,
         sub_indices=sub_indices,
         z_scores=z_scores,
         bucket_terms=bucket_terms,
         weights=w,
+        effective_weights=effective_weights,
+        components_by_bucket=components_by_bucket,
+        available_component_count=available_component_count,
+        available_bucket_count=available_bucket_count,
+        coverage_ok=coverage_ok,
+        published_mask=published_mask,
         meta=meta,
+        first_valid_date=first_valid_date,
+        first_published_date=first_published_date,
     )

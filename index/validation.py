@@ -103,8 +103,17 @@ def rolling_correlation(index: pd.Series, df: pd.DataFrame,
 
 
 def standardized_overlay(index: pd.Series, df: pd.DataFrame) -> pd.DataFrame:
-    """Index + benchmarks each standardised to z, for a same-scale overlay."""
+    """Index + benchmarks each standardised to z, for a same-scale overlay.
+
+    Restricted to the index's published (non-NaN) span so every series is
+    standardised over the same period — otherwise the benchmarks (which run from
+    2015) would be centred on a different sample than the index (published from
+    ~2019), distorting the visual comparison.
+    """
+    valid = index.dropna()
     panel = aligned_panel(index, df)
+    if len(valid):
+        panel = panel.loc[(panel.index >= valid.index[0]) & (panel.index <= valid.index[-1])]
     return panel.apply(_zscore_full)
 
 
