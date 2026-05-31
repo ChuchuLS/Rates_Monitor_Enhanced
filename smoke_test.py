@@ -1,84 +1,83 @@
-"""Headless smoke test — verifies the package builds the index without a
-Streamlit server. Run: python smoke_test.py"""
-import sys, time, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+"""
+scripts/diagnose_spikes.py
+==========================
+Reproducible diagnostic for index instability (requirement #4 / #10). Identifies
+which components and buckets drive the largest moves in a chosen window, flags
+low-variation (spike-prone) series, and reports the coverage timeline and the
+date from which the index is published.
 
-import pandas as pd
+Usage:
+    python scripts/diagnose_spikes.py [START END]
+    e.g. python scripts/diagnose_spikes.py 2016-01-01 2018-06-30
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 
-print("1. Importing all modules ...")
-from data.loader import _load_dataframe, data_source_label, get_series
-from data.quality import validate_data, quality_summary
-from data.transforms import rolling_zscore
-from config.tickers import TICKERS
-from index.components import build_components, BUCKETS
-from index.composite import compute_index, regime_label
-from index import validation as V
-# chart modules import streamlit but must not call st.* at import time
-import charts.common, charts.rates, charts.funding, charts.credit, charts.liquidity
-print("   all imports OK")
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+pd.set_option("display.width", 160, "display.max_columns", 30)
 
-print(f"2. Loading data (source: {data_source_label()}) ...")
-t0 = time.time()
-df = _load_dataframe()
-print(f"   {df.shape[0]:,} rows x {df.shape[1]:,} cols in {time.time()-t0:.2f}s")
-assert isinstance(df.index, pd.DatetimeIndex)
+from data.loader import _load_core            # noqa: E402
+from index.components import build_components, BUCKET_OF, DIRECTION  # noqa: E402
+from index.composite import compute_index     # noqa: E402
 
-print("3. Building components ...")
-raw, meta = build_components(df)
-avail = int(meta["available"].sum())
-print(f"   {avail}/{len(meta)} components available")
-print(f"   missing: {list(meta.loc[~meta['available'],'component'])}")
-assert avail >= 15, "expected most components present"
+START, END = (sys.argv[1], sys.argv[2]) if len(sys.argv) >= 3 else ("2016-01-01", "2018-06-30")
 
-print("4. Computing index ...")
-t0 = time.time()
-res = compute_index(df)
-dt = time.time() - t0
-print(f"   computed in {dt:.2f}s")
-assert dt < 5, "index computation too slow"
 
-latest = res.latest
-print(f"   latest index = {latest:.2f}  regime = {res.latest_regime}")
-assert 0 < latest < 100, "index out of expected range"
-assert res.latest_regime in ("Loose", "Neutral", "Tight", "Stress")
+def main() -> None:
+    df = _load_core()
+    res = compute_index(df)
 
-print("5. Changes:", {k: round(v, 2) for k, v in res.changes().items()})
+    print(f"=== Coverage & publication ===")
+    print(f"first computable date : {res.first_valid_date}")
+    print(f"first PUBLISHED date  : {res.first_published_date}  <- reliable from here")
+    print(f"latest index          : {res.latest:.2f} ({res.latest_regime})")
 
-print("6. Contribution reconciliation ...")
-lvl = res.level_contributions()
-print("   level contributions:", {k: round(v, 3) for k, v in lvl.items()})
-recon = abs(lvl.sum() - (latest - 50.0))
-print(f"   sum(level contrib) - (index-50) = {recon:.6f}")
-assert recon < 1e-6, "level contributions must reconcile to index-50"
+    print(f"\n=== Spike attribution {START}..{END} (pre-fix diagnostic window) ===")
+    pz = res.z_scores.loc[START:END].dropna(how="all")
+    pt = res.bucket_terms.loc[START:END].dropna(how="all")
+    if pt.empty:
+        print("No computable index values in this window.")
+    else:
+        print("\nTop spike-driving BUCKETS (largest |contribution| each day):")
+        print(pt.abs().idxmax(axis=1).value_counts())
+        print("\nTop spike-driving COMPONENTS (largest |z| each day):")
+        print(pz.abs().idxmax(axis=1).value_counts())
 
-for h in ("1w", "1m", "3m"):
-    cc = res.change_contributions(h)
-    idx_chg = res.changes()[h]
-    if not cc.empty and not np.isnan(idx_chg):
-        r = abs(cc.sum() - idx_chg)
-        assert r < 1e-6, f"{h} change contributions must reconcile ({r})"
-        print(f"   {h} change contrib reconciles (Σ={cc.sum():+.3f} vs Δindex={idx_chg:+.3f})")
+    print(f"\n=== Low-variation flags (raw series, {START}..{END}) ===")
+    raw, _ = build_components(df)
+    rows = []
+    for cid, s in raw.items():
+        adj = (s * DIRECTION[cid]).sort_index()
+        w = adj.loc[START:END]
+        if w.dropna().empty:
+            continue
+        rstd = adj.rolling(1260, min_periods=504).std().loc[START:END]
+        nun = adj.rolling(1260, min_periods=504).apply(
+            lambda a: np.unique(a[~np.isnan(a)]).size, raw=True).loc[START:END]
+        rows.append({
+            "component": cid, "bucket": BUCKET_OF[cid],
+            "frac_days_flat": round(float((w.diff() == 0).mean()), 3),
+            "min_rolling_std": round(float(rstd.min()), 5) if rstd.notna().any() else np.nan,
+            "min_rolling_nunique": int(nun.min()) if nun.notna().any() else -1,
+        })
+    flags = pd.DataFrame(rows).sort_values("frac_days_flat", ascending=False)
+    print(flags.to_string(index=False))
 
-print("7. Drivers (1m):", res.drivers("1m"))
+    print("\n=== Live components per bucket at key dates ===")
+    for d in ["2017-01-03", "2019-08-19", "2022-08-01"]:
+        near = res.z_scores.index[res.z_scores.index.get_indexer(
+            [pd.Timestamp(d)], method="nearest")[0]]
+        per = res.components_by_bucket.loc[near].to_dict()
+        print(f"   {d}: {per}  -> qualifying buckets="
+              f"{int(res.available_bucket_count.loc[near])}, "
+              f"published={bool(res.published_mask.loc[near])}")
 
-print("8. Validation / benchmarks ...")
-bench = V.benchmark_looseness(df)
-print("   benchmarks available:", list(bench))
-corr = V.correlation_table(res.index, df)
-print(corr.to_string(index=False))
-crisis = V.crisis_behaviour(res.index)
-print("   crisis troughs:")
-for _, row in crisis.iterrows():
-    print(f"     {row['crisis']:<24} min={row['min']:.1f}")
-roll = V.rolling_correlation(res.index, df)
-print(f"   rolling-corr frame: {roll.shape}")
-if bench:
-    ll = V.lead_lag(res.index, df, list(bench)[0])
-    print(f"   lead-lag peak lag = {ll.idxmax()}d (corr {ll.max():.2f})")
 
-print("9. Data quality ...")
-rep = validate_data(df, TICKERS)
-print("   summary:", quality_summary(rep))
-
-print("\nALL SMOKE TESTS PASSED ✓")
+if __name__ == "__main__":
+    main()

@@ -1,470 +1,321 @@
 """
-app.py — Rates, Funding & Liquidity Monitor
-===========================================
-Thin Streamlit entry point: layout, the password gate, the sidebar, and page
-routing. All heavy lifting (data loading, chart construction, ticker
-definitions, the Composite Liquidity Index) lives in the config / data / charts
-/ index packages — see each module's docstring.
+index/composite.py
+==================
+Constructs the Composite Liquidity Index from the raw components.
 
-Page structure (requirement #12)
-    1. Composite Liquidity Index   (homepage — leads with the summary panel)
-    2. Money Market Plumbing
-    3. Dollar Funding / XCCY Basis
-    4. Credit Liquidity
-    5. Rates / Real Rates / Curve Regime
-    6. Inflation Expectations
-    7. Data Quality
+Pipeline
+--------
+1. For each component: multiply by its direction (looser = higher), then take a
+   rolling z-score (with a low-variation guard) -> ``z_scores`` frame.
+2. Sub-index per bucket = mean of that bucket's available component z-scores,
+   but ONLY on days the bucket has at least ``min_per_bucket`` live components.
+   (A single fragile series must not *be* a bucket — that was the source of the
+   2016-2018 spikes, when money-market = EFFR-IORB alone.)
+3. Composite z = weighted average of the sub-indices, with weights renormalised
+   across whichever buckets qualify that day. The renormalised (effective)
+   weights are exposed so the concentration is transparent.
+4. Rescale: ``liquidity_index = 50 + 10 * composite_z`` (50 neutral).
+5. COVERAGE GATE: a date is only PUBLISHED if it has >= ``min_buckets``
+   qualifying buckets and >= ``min_components`` contributing components, and is
+   past the rolling-z warm-up. Dates failing the gate are set to NaN in the
+   published ``index`` (the unmasked ``raw_index`` is retained for diagnostics).
+6. Regime label, period changes, and an additive bucket contribution
+   decomposition (terms sum exactly to index-50, so the decomposition always
+   reconciles).
 """
 
 from __future__ import annotations
 
-import os
-import sys
+from dataclasses import dataclass, field
 
-# Be defensive: ensure this script's directory is importable even if Streamlit's
-# automatic sys.path insertion ever changes. Lets `from config... import ...` work.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
 
-from config.theme import (
-    BG, GRID, LINE_WHITE, TEXT_DIM, TEXT_VERY_DIM, DARK_LAYOUT,
-    ACCENT_GREEN, ACCENT_RED, ACCENT_AMBER,
-    CURVE_REGIME_COLORS, CURVE_REGIME_LABELS, REGIME_COLORS, page_css,
+from data.transforms import (
+    rolling_zscore, lowfreq_zscore, OBS_WINDOW_BY_FREQ,
+    Z_WINDOW, Z_MIN_PERIODS, Z_CLIP, Z_MIN_UNIQUE,
 )
-from config.tickers import (
-    TICKERS, REGIME_COUNTRIES, REAL_RATE_TENORS, TENOR_PAIRS,
-    INFL_BE_TENORS, INFL_ZCIS_TENORS,
-)
-from data.loader import (
-    load_data, date_filter, get_series, data_source_label,
-    source_signature, cache_status_label, load_meta,
-)
-from data.quality import validate_data, quality_summary, STALE_BDAYS
-from charts.common import section_header
-from charts.rates import classify_regime, big_regime_panel, big_curve_panel
-from charts.funding import render_money_market, render_xccy
-from charts.credit import render_credit
-from charts.liquidity import render_summary_panel, render_index_page
-from index.composite import compute_index
-
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Rates & Liquidity Monitor",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from index.components import (
+    BUCKETS, DIRECTION, BUCKET_OF, build_components, max_ffill_of,
+    frequency_of, observation_mode_of, observation_weekday_of,
 )
 
+# Index scaling
+INDEX_CENTER = 50.0
+INDEX_SCALE = 10.0
 
-# ---------------------------------------------------------------------------
-# Password gate (ported unchanged: disabled unless `app_password` secret set)
-# ---------------------------------------------------------------------------
-def _check_password() -> bool:
-    # Reading st.secrets raises StreamlitSecretNotFoundError when no
-    # secrets.toml is present (e.g. local dev). Treat that as "no password
-    # configured" so the gate stays disabled rather than crashing.
-    try:
-        expected = st.secrets.get("app_password")
-    except Exception:
-        expected = None
-    if not expected:
-        return True
-    if st.session_state.get("password_correct"):
-        return True
-    st.markdown(
-        """
-        <div style="max-width:420px;margin:5rem auto 1rem;padding:2rem;
-                    background:#0a0a0a;border:1px solid #1a1a1a;border-radius:6px;
-                    font-family:Inter,system-ui,sans-serif;color:#fff;">
-          <div style="font-size:18px;font-weight:700;letter-spacing:0.06em;
-                      text-transform:uppercase;margin-bottom:6px;">
-            Rates &amp; Liquidity Monitor</div>
-          <div style="font-size:11px;color:#888;letter-spacing:0.08em;
-                      text-transform:uppercase;margin-bottom:1.5rem;">
-            Authentication required</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    pwd = st.text_input("Password", type="password", key="password_input",
-                        label_visibility="collapsed", placeholder="Enter password")
-    if pwd:
-        if pwd == expected:
-            st.session_state["password_correct"] = True
-            st.rerun()
+# Regime thresholds. Higher = looser.
+REGIME_THRESHOLDS = [(60.0, "Loose"), (45.0, "Neutral"), (35.0, "Tight")]
+
+# Headline change horizons in business days
+HORIZONS = {"1w": 5, "1m": 21, "3m": 63}
+
+# -------------------- Coverage / reliability rules --------------------------
+# A bucket needs at least this many live components before its sub-index counts.
+# Stops a lone, possibly-flat series from carrying a full bucket weight.
+MIN_COMPONENTS_PER_BUCKET = 2
+# A date is only published if at least this many buckets qualify ...
+MIN_AVAILABLE_BUCKETS = 3
+# ... and at least this many components (within qualifying buckets) contribute.
+MIN_AVAILABLE_COMPONENTS = 8
+# After the index first becomes computable, skip this many business days so the
+# rolling z-scores are past their warm-up before we publish.
+WARMUP_DAYS_AFTER_FIRST_VALID = 126
+
+
+def regime_label(value: float) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return "n/a"
+    for cutoff, label in REGIME_THRESHOLDS:
+        if value >= cutoff:
+            return label
+    return "Stress"
+
+
+@dataclass
+class IndexResult:
+    """Everything the dashboard needs to render the index, in one object."""
+    index: pd.Series             # PUBLISHED 50-centred index (low-coverage -> NaN)
+    raw_index: pd.Series         # index before the coverage/warm-up mask (diagnostics)
+    composite_z: pd.Series       # weighted-average z (raw_index = 50 + 10*z)
+    sub_indices: pd.DataFrame    # date x bucket sub-index z-scores (min_per_bucket applied)
+    z_scores: pd.DataFrame       # date x component direction-adjusted z-scores
+    bucket_terms: pd.DataFrame   # date x bucket additive contributions to (raw_index-50)
+    component_terms: pd.DataFrame  # date x component additive contributions to (raw_index-50)
+    weights: pd.Series           # base bucket weights (normalised over buckets seen)
+    effective_weights: pd.DataFrame  # date x bucket renormalised weights actually used
+    components_by_bucket: pd.DataFrame  # date x bucket live-component counts
+    available_component_count: pd.Series  # contributing components per day
+    available_bucket_count: pd.Series     # qualifying buckets per day
+    coverage_ok: pd.Series       # bool: meets min bucket/component rules
+    published_mask: pd.Series    # bool: coverage_ok AND past warm-up
+    meta: pd.DataFrame           # per-component availability metadata
+    first_valid_date: pd.Timestamp | None = None      # first computable date
+    first_published_date: pd.Timestamp | None = None  # first reliable/published date
+
+    # ------- convenience accessors (operate on the PUBLISHED index) ----------
+    @property
+    def latest(self) -> float:
+        return float(self.index.dropna().iloc[-1]) if self.index.notna().any() else float("nan")
+
+    @property
+    def latest_regime(self) -> str:
+        return regime_label(self.latest)
+
+    def changes(self) -> dict[str, float]:
+        s = self.index.dropna()
+        out = {}
+        for name, n in HORIZONS.items():
+            out[name] = float(s.iloc[-1] - s.iloc[-1 - n]) if len(s) > n else float("nan")
+        return out
+
+    def _terms_on_published(self, terms: pd.DataFrame) -> pd.DataFrame:
+        """Restrict a terms frame to the published index dates, so contribution
+        differences reconcile exactly to the published index changes regardless of
+        any unpublished/low-frequency rows elsewhere in the frame."""
+        if terms is None or terms.empty:
+            return pd.DataFrame()
+        pub = self.index.dropna().index
+        return terms.reindex(pub)
+
+    def level_contributions(self) -> pd.Series:
+        terms = self._terms_on_published(self.bucket_terms).dropna(how="all")
+        return terms.iloc[-1] if len(terms) else pd.Series(dtype=float)
+
+    def change_contributions(self, horizon: str = "1m") -> pd.Series:
+        n = HORIZONS[horizon]
+        terms = self._terms_on_published(self.bucket_terms).dropna(how="all")
+        if len(terms) <= n:
+            return pd.Series(dtype=float)
+        return terms.iloc[-1] - terms.iloc[-1 - n]
+
+    def drivers(self, horizon: str = "1m") -> tuple[str, str]:
+        contrib = self.change_contributions(horizon)
+        if contrib.empty or contrib.isna().all():
+            return ("n/a", "n/a")
+        easing_lbl = BUCKETS.get(contrib.idxmax(), {}).get("label", contrib.idxmax())
+        tight_lbl = BUCKETS.get(contrib.idxmin(), {}).get("label", contrib.idxmin())
+        return (easing_lbl, tight_lbl)
+
+    def coverage_frame(self) -> pd.DataFrame:
+        """Tidy frame for the coverage diagnostic chart."""
+        return pd.DataFrame({
+            "components": self.available_component_count,
+            "buckets": self.available_bucket_count,
+        })
+
+    def component_level_contributions(self) -> pd.Series:
+        """Latest contribution of each component to (index - 50), index points."""
+        terms = self._terms_on_published(self.component_terms).dropna(how="all")
+        return terms.iloc[-1] if len(terms) else pd.Series(dtype=float)
+
+    def component_change_contributions(self, horizon: str = "1m") -> pd.Series:
+        """Each component's contribution to the index change over ``horizon``."""
+        n = HORIZONS[horizon]
+        terms = self._terms_on_published(self.component_terms).dropna(how="all")
+        if len(terms) <= n:
+            return pd.Series(dtype=float)
+        return terms.iloc[-1] - terms.iloc[-1 - n]
+
+
+def compute_index(
+    df: pd.DataFrame,
+    weights: dict[str, float] | None = None,
+    z_window: int = Z_WINDOW,
+    z_min_periods: int = Z_MIN_PERIODS,
+    z_clip: float = Z_CLIP,
+    z_min_unique: int | None = Z_MIN_UNIQUE,
+    min_per_bucket: int = MIN_COMPONENTS_PER_BUCKET,
+    min_buckets: int = MIN_AVAILABLE_BUCKETS,
+    min_components: int = MIN_AVAILABLE_COMPONENTS,
+    warmup_days: int = WARMUP_DAYS_AFTER_FIRST_VALID,
+    lowfreq_handling: bool = True,
+    ffill_cap: str = "by_freq",
+) -> IndexResult:
+    """Build the Composite Liquidity Index from the price panel.
+
+    ``lowfreq_handling`` (True) z-scores weekly/low-frequency components on their
+    true observations; set False to treat every daily row as a fresh print (the
+    legacy behaviour). ``ffill_cap`` is "by_freq" (per-component caps) or "none"
+    (unlimited forward-fill, legacy).
+    """
+    # 1. Raw components + availability metadata.
+    raw, meta = build_components(df)
+
+    # 2. Direction-adjust then z-score each available component. Daily series use
+    #    a daily rolling window; weekly/low-frequency series are standardised on
+    #    their true observations (e.g. Wednesdays) and the z is forward-filled.
+    daily_grid = None
+    if raw:
+        lo = min(s.index.min() for s in raw.values())
+        hi = max(s.index.max() for s in raw.values())
+        daily_grid = pd.date_range(lo, hi, freq="B")
+    cap_daily = (lambda cid: max_ffill_of(cid)) if ffill_cap == "by_freq" else (lambda cid: None)
+
+    z_cols: dict[str, pd.Series] = {}
+    for comp_id, series in raw.items():
+        adjusted = series * DIRECTION[comp_id]   # looser = higher
+        mode = observation_mode_of(comp_id)
+        if lowfreq_handling and mode != "daily":
+            win, minp = OBS_WINDOW_BY_FREQ.get(frequency_of(comp_id), (Z_WINDOW, Z_MIN_PERIODS))
+            z_cols[comp_id] = lowfreq_zscore(
+                adjusted, daily_grid, mode, observation_weekday_of(comp_id),
+                window=win, min_periods=minp, clip=z_clip, min_unique=z_min_unique,
+                max_ffill=max_ffill_of(comp_id),
+            )
         else:
-            st.error("Incorrect password.")
-    return False
+            z_cols[comp_id] = rolling_zscore(
+                adjusted, window=z_window, min_periods=z_min_periods, clip=z_clip,
+                min_unique=z_min_unique, max_ffill=cap_daily(comp_id),
+            )
+    z_scores = pd.DataFrame(z_cols).sort_index() if z_cols else pd.DataFrame()
+    # Pin the whole index to a business-day grid. Some raw Bloomberg series carry
+    # stray weekend timestamps; without this, daily components would get z-scores
+    # on Sat/Sun while weekly components (already on a B-day grid) are NaN there,
+    # giving inconsistent bucket coverage on weekends and breaking the change
+    # reconciliation (the row-counted "1w ago" could land on a weekend).
+    if not z_scores.empty and daily_grid is not None:
+        z_scores = z_scores.reindex(daily_grid)
 
+    if z_scores.empty:
+        empty = pd.Series(dtype=float)
+        empty_df = pd.DataFrame()
+        return IndexResult(empty, empty, empty, empty_df, z_scores, empty_df,
+                           empty_df, pd.Series(dtype=float), empty_df, empty_df,
+                           empty, empty, empty, empty, meta)
 
-if not _check_password():
-    st.stop()
+    # 3. Per-bucket live-component counts and sub-index (with min_per_bucket).
+    sub_data: dict[str, pd.Series] = {}
+    count_data: dict[str, pd.Series] = {}
+    for bucket in BUCKETS:
+        members = [c for c in z_scores.columns if BUCKET_OF[c] == bucket]
+        if not members:
+            count_data[bucket] = pd.Series(0, index=z_scores.index)
+            continue
+        member_z = z_scores[members]
+        cnt = member_z.notna().sum(axis=1)
+        count_data[bucket] = cnt
+        # Sub-index only on days the bucket has >= min_per_bucket live components.
+        sub_data[bucket] = member_z.mean(axis=1, skipna=True).where(cnt >= min_per_bucket)
+    components_by_bucket = pd.DataFrame(count_data).sort_index()
+    sub_indices = pd.DataFrame(sub_data).sort_index() if sub_data else pd.DataFrame()
 
-# ---------------------------------------------------------------------------
-# Global styling + data
-# ---------------------------------------------------------------------------
-st.markdown(page_css(), unsafe_allow_html=True)
+    # 4. Weighted composite with per-row weight renormalisation over QUALIFYING
+    #    buckets (those with a non-NaN sub-index that day).
+    base_weights = {b: BUCKETS[b]["weight"] for b in BUCKETS}
+    if weights:
+        base_weights.update(weights)
+    w = pd.Series(base_weights)
+    w = w[[b for b in w.index if b in sub_indices.columns]]
+    w = w / w.sum() if w.sum() else w
 
-df = load_data()
+    avail = sub_indices[w.index].notna()                 # qualifying buckets per day
+    row_w = avail.mul(w, axis=1).sum(axis=1).replace(0.0, np.nan)
+    effective_weights = avail.mul(w, axis=1).div(row_w, axis=0)   # rows sum to 1.0
 
+    # Additive bucket terms: 10 * eff_weight_b * sub_b. Sum -> raw_index - 50.
+    bucket_terms = INDEX_SCALE * sub_indices[w.index].mul(effective_weights)
+    raw_index = INDEX_CENTER + bucket_terms.sum(axis=1, min_count=1)
+    composite_z = (raw_index - INDEX_CENTER) / INDEX_SCALE
 
-@st.cache_data(show_spinner="Building Composite Liquidity Index...")
-def _build_index(_source_hash: str):
-    """Compute the index once per data version. Keyed on the DATA.xlsx content
-    hash, so editing the Excel (any change, not just new rows) recomputes it."""
-    return compute_index(load_data())
+    # Component-level additive terms (requirement #3):
+    #   term_i = 10 * eff_weight_b * z_i / n_live_in_bucket_b
+    # so terms sum within a bucket to bucket_term_b, and across all to raw_index-50.
+    comp_cols: dict[str, pd.Series] = {}
+    for comp_id in z_scores.columns:
+        b = BUCKET_OF[comp_id]
+        if b not in effective_weights.columns:
+            continue
+        n_live = components_by_bucket[b].replace(0, np.nan)
+        comp_cols[comp_id] = INDEX_SCALE * effective_weights[b] * z_scores[comp_id] / n_live
+    component_terms = pd.DataFrame(comp_cols).sort_index() if comp_cols else pd.DataFrame()
 
+    # 5. Coverage diagnostics + publication gate.
+    available_bucket_count = avail.sum(axis=1)
+    # Components that actually contribute = those in qualifying buckets.
+    contributing = pd.Series(0, index=z_scores.index)
+    for bucket in avail.columns:
+        members = [c for c in z_scores.columns if BUCKET_OF[c] == bucket]
+        if members:
+            contributing = contributing.add(
+                z_scores[members].notna().sum(axis=1).where(avail[bucket], 0),
+                fill_value=0)
+    available_component_count = contributing.astype(int)
 
-index_result = _build_index(source_signature())
+    coverage_ok = (available_bucket_count >= min_buckets) & \
+                  (available_component_count >= min_components)
 
-
-# ===========================================================================
-# Page 5 — Rates / Real Rates / Curve Regime (ported Curve Explorer)
-# ===========================================================================
-def render_rates_page(df: pd.DataFrame, dff: pd.DataFrame) -> None:
-    section_header(
-        "Rates / Real Rates / Curve Regime",
-        "Pick a country, chart type, tenor pair, and lookback to drill into "
-        "rates structure",
-    )
-
-    cols = st.columns([1, 1.3, 1, 1, 2])
-    with cols[0]:
-        country = st.selectbox("COUNTRY", options=list(REGIME_COUNTRIES), index=0,
-                               key="explorer_country")
-    with cols[1]:
-        chart_type = st.selectbox("CHART TYPE",
-                                  options=["Curve slope (regime)", "Real rate curve"],
-                                  index=0, key="explorer_chart")
-    is_slope = chart_type == "Curve slope (regime)"
-    with cols[2]:
-        if is_slope:
-            pair = st.selectbox("TENOR PAIR", options=list(TENOR_PAIRS.keys()),
-                                index=0, key="explorer_pair")
-        else:
-            pair = None
-            st.markdown("<div style='color:#444;font-size:11px;padding-top:1.7rem;'>"
-                        "— n/a —</div>", unsafe_allow_html=True)
-    with cols[3]:
-        if is_slope:
-            lb_choice = st.selectbox("LOOKBACK", options=["5d", "10d", "20d", "60d", "120d"],
-                                     index=2, key="explorer_lookback")
-            lookback = int(lb_choice.rstrip("d"))
-        else:
-            lookback = None
-            st.markdown("<div style='color:#444;font-size:11px;padding-top:1.7rem;'>"
-                        "— n/a —</div>", unsafe_allow_html=True)
-
-    if is_slope:
-        short_t, long_t = TENOR_PAIRS[pair]
-        short = get_series(dff, f"{country}_{short_t}")
-        long_ = get_series(dff, f"{country}_{long_t}")
-        if len(short) == 0 or len(long_) == 0:
-            st.warning(f"No nominal yield data for {country} {short_t}/{long_t}. "
-                       "Try a different pair or country.")
-            return
-        slope, regime = classify_regime(short, long_, lookback)
-        chips = " &nbsp;&nbsp; ".join(
-            f"<span style='display:inline-block;width:11px;height:11px;"
-            f"background:{CURVE_REGIME_COLORS[k]};vertical-align:middle;"
-            f"margin-right:5px;'></span>"
-            f"<span style='color:#bbb;font-size:10px;letter-spacing:0.05em;"
-            f"text-transform:uppercase;'>{CURVE_REGIME_LABELS[k]}</span>"
-            for k in ["bull_steepener", "bear_steepener", "steepener_twist",
-                      "bull_flattener", "bear_flattener", "flattener_twist"])
-        st.markdown(f"<div style='padding:0.5rem 0 0.25rem;'>{chips}</div>",
-                    unsafe_allow_html=True)
-        st.plotly_chart(
-            big_regime_panel(slope, regime, f"{country} {pair} (regime vs {lookback}d ago)"),
-            use_container_width=True, key="explorer_slope",
-            config={"displayModeBar": False})
+    # Warm-up: skip the first warmup_days business days after the index is first
+    # computable, so the rolling z-scores are mature before we publish.
+    computable = raw_index.notna()
+    first_valid_date = raw_index.index[computable.argmax()] if computable.any() else None
+    if first_valid_date is not None and warmup_days > 0:
+        warmup_cutoff = first_valid_date + pd.tseries.offsets.BusinessDay(warmup_days)
+        warmup_ok = pd.Series(raw_index.index >= warmup_cutoff, index=raw_index.index)
     else:
-        anchor = dff.index.max() if len(dff) else df.index.max()
-        tenors = REAL_RATE_TENORS.get(country, [])
-        if not tenors:
-            st.warning(f"No real-rate curve configured for {country}.")
-            return
-        st.plotly_chart(
-            big_curve_panel(df, f"{country} real rate curve", tenors, anchor,
-                            y_title="Real yield (%)"),
-            use_container_width=True, key="explorer_curve",
-            config={"displayModeBar": False})
+        warmup_ok = pd.Series(True, index=raw_index.index)
 
+    published_mask = coverage_ok.reindex(raw_index.index, fill_value=False) & warmup_ok
+    index = raw_index.where(published_mask)
+    published = index.dropna()
+    first_published_date = published.index[0] if len(published) else None
 
-# ===========================================================================
-# Page 6 — Inflation Expectations (ported)
-# ===========================================================================
-def render_inflation_page(df: pd.DataFrame, dff: pd.DataFrame) -> None:
-    section_header(
-        "Inflation Expectations",
-        "TIPS breakevens · ZC inflation swaps · 5Y5Y forward",
+    return IndexResult(
+        index=index,
+        raw_index=raw_index,
+        composite_z=composite_z,
+        sub_indices=sub_indices,
+        z_scores=z_scores,
+        bucket_terms=bucket_terms,
+        component_terms=component_terms,
+        weights=w,
+        effective_weights=effective_weights,
+        components_by_bucket=components_by_bucket,
+        available_component_count=available_component_count,
+        available_bucket_count=available_bucket_count,
+        coverage_ok=coverage_ok,
+        published_mask=published_mask,
+        meta=meta,
+        first_valid_date=first_valid_date,
+        first_published_date=first_published_date,
     )
-    choice = st.selectbox(
-        "MEASURE",
-        options=["TIPS breakeven curve", "ZC inflation swap curve",
-                 "5Y5Y forward inflation swap"],
-        index=0, key="infl_choice")
-    anchor = dff.index.max() if len(dff) else df.index.max()
-
-    if choice == "TIPS breakeven curve":
-        st.plotly_chart(
-            big_curve_panel(df, "US TIPS breakeven curve", INFL_BE_TENORS, anchor,
-                            y_title="Breakeven (%)"),
-            use_container_width=True, key="infl_be", config={"displayModeBar": False})
-    elif choice == "ZC inflation swap curve":
-        st.plotly_chart(
-            big_curve_panel(df, "USD ZC inflation swap curve", INFL_ZCIS_TENORS, anchor,
-                            y_title="Inflation swap (%)"),
-            use_container_width=True, key="infl_zcis", config={"displayModeBar": False})
-    else:
-        s = get_series(dff, "INFL_5Y5Y")
-        fig = go.Figure()
-        if len(s):
-            fig.add_trace(go.Scatter(
-                x=s.index, y=s.values, mode="lines",
-                line=dict(color=LINE_WHITE, width=1.4),
-                fill="tozeroy", fillcolor="rgba(255,255,255,0.05)",
-                hovertemplate="%{x|%Y-%m-%d}: %{y:.2f}%<extra></extra>"))
-            fig.add_trace(go.Scatter(
-                x=[s.index[-1]], y=[s.iloc[-1]], mode="markers",
-                marker=dict(color=LINE_WHITE, size=8, line=dict(color=BG, width=1)),
-                hoverinfo="skip", showlegend=False))
-            fig.add_hline(y=2.0, line=dict(color=ACCENT_AMBER, width=0.8, dash="dash"),
-                          annotation_text="Fed target 2%", annotation_position="right",
-                          annotation_font=dict(size=10, color=ACCENT_AMBER))
-        last_val = s.iloc[-1] if len(s) else float("nan")
-        last_str = f"{last_val:+.2f}%" if pd.notna(last_val) else "—"
-        fig.update_layout(
-            **DARK_LAYOUT, height=520, margin=dict(l=70, r=30, t=50, b=40),
-            title=dict(text=(f"<span style='color:#fff;font-weight:700;"
-                             f"letter-spacing:0.05em;font-size:14px;'>USD 5Y5Y FORWARD "
-                             f"INFLATION SWAP</span> &nbsp;<span style='color:#aaa;"
-                             f"font-size:12px;'>{last_str}</span>"),
-                       font=dict(size=13), x=0, xanchor="left", y=0.97))
-        fig.update_xaxes(showgrid=False, tickfont=dict(size=11, color="#bbb"),
-                         linecolor="#222")
-        fig.update_yaxes(showgrid=True, gridcolor=GRID, zeroline=False,
-                         tickfont=dict(size=11, color="#bbb"), linecolor="#222",
-                         ticksuffix="%",
-                         title=dict(text="5Y5Y forward (%)", font=dict(size=11, color="#888")))
-        st.plotly_chart(fig, use_container_width=True, key="infl_5y5y",
-                        config={"displayModeBar": False})
-
-
-# ===========================================================================
-# Page 7 — Data Quality (requirement #2)
-# ===========================================================================
-def render_data_quality_page(df: pd.DataFrame) -> None:
-    section_header(
-        "Data Quality",
-        f"Per-ticker coverage check · stale = no obs in last {STALE_BDAYS} business days",
-    )
-
-    # Data-source / cache status (confirms the dashboard is on the latest Excel).
-    meta = load_meta()
-    status = cache_status_label()
-    status_colour = (ACCENT_GREEN if status.startswith(("Fresh", "Rebuilt"))
-                     else ACCENT_AMBER)
-    latest_date = df.index.max().date()
-    n_rows, n_cols = len(df), df.shape[1]
-    src_end = meta.get("end_date") or str(latest_date)
-    st.markdown(
-        f"""
-        <div style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:6px;
-                    padding:0.7rem 0.9rem;margin:0.2rem 0 0.8rem;
-                    display:flex;flex-wrap:wrap;gap:1.6rem;align-items:baseline;">
-          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
-               text-transform:uppercase;">Source file</span><br>
-               <span style="font-size:13px;color:#fff;font-weight:700;">DATA.xlsx</span></div>
-          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
-               text-transform:uppercase;">Parquet cache</span><br>
-               <span style="font-size:13px;color:{status_colour};font-weight:700;">
-               {status}</span></div>
-          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
-               text-transform:uppercase;">Latest data date</span><br>
-               <span style="font-size:13px;color:#fff;font-weight:700;">{latest_date}</span></div>
-          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
-               text-transform:uppercase;">Rows</span><br>
-               <span style="font-size:13px;color:#fff;font-weight:700;">{n_rows:,}</span></div>
-          <div><span style="font-size:10px;color:#888;letter-spacing:0.1em;
-               text-transform:uppercase;">Columns</span><br>
-               <span style="font-size:13px;color:#fff;font-weight:700;">{n_cols:,}</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    report = validate_data(df, TICKERS)
-    summary = quality_summary(report)
-
-    k1, k2, k3, k4 = st.columns(4, gap="small")
-    for col, label, value, colour in (
-        (k1, "Tickers tracked", summary["total"], "#fff"),
-        (k2, "Healthy", summary["healthy"], ACCENT_GREEN),
-        (k3, "Stale", summary["stale"], ACCENT_AMBER),
-        (k4, "Missing", summary["missing"], ACCENT_RED),
-    ):
-        with col:
-            st.markdown(
-                f"""
-                <div class="kpi-card">
-                  <div class="kpi-label">{label}</div>
-                  <div class="kpi-value" style="color:{colour};font-size:28px;">{value}</div>
-                </div>
-                """,
-                unsafe_allow_html=True)
-
-    st.markdown("<div style='height:0.6rem;'></div>", unsafe_allow_html=True)
-
-    show = st.radio("FILTER", ["All", "Problems only (missing or stale)"],
-                    index=0, horizontal=True, key="dq_filter")
-    table = report.copy()
-    if show.startswith("Problems"):
-        table = table[(~table["exists"]) | (table["stale"])]
-
-    table["last_date"] = pd.to_datetime(table["last_date"]).dt.date.astype("string")
-    table["last_date"] = table["last_date"].fillna("—")
-    table["missing_pct"] = (table["missing_pct"] * 100)
-    disp = table.rename(columns={
-        "key": "Key", "ticker": "Bloomberg ticker", "exists": "Exists",
-        "last_date": "Last date", "missing_pct": "Missing %", "n_obs": "Obs",
-        "stale": "Stale"})
-    disp = disp[["Key", "Bloomberg ticker", "Exists", "Last date",
-                 "Missing %", "Obs", "Stale"]]
-
-    def _row_style(row):
-        if not row["Exists"]:
-            return ["background-color: rgba(208,72,72,0.12)"] * len(row)
-        if row["Stale"]:
-            return ["background-color: rgba(217,152,48,0.12)"] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(
-        disp.style.apply(_row_style, axis=1).format(
-            {"Missing %": "{:.1f}", "Obs": "{:,}"}, na_rep="—"),
-        hide_index=True, use_container_width=True, height=620)
-    st.caption(
-        "Red rows = ticker column absent from the dataset · amber rows = stale "
-        "(no recent observations). Missing tickers degrade gracefully — the index "
-        "and charts simply skip them rather than crashing.")
-
-
-# ===========================================================================
-# Sidebar — navigation + lookback window
-# ===========================================================================
-PAGES = [
-    "1 · Composite Liquidity Index",
-    "2 · Money Market Plumbing",
-    "3 · Dollar Funding / XCCY Basis",
-    "4 · Credit Liquidity",
-    "5 · Rates / Real Rates / Curve",
-    "6 · Inflation Expectations",
-    "7 · Data Quality",
-]
-
-with st.sidebar:
-    st.markdown(
-        """
-        <div style="padding:0.5rem 0 0.25rem;">
-          <div style="font-size:14px;font-weight:700;letter-spacing:0.08em;
-                      color:#fff;text-transform:uppercase;">
-            Rates &amp; Liquidity Monitor</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.caption(f"{df.index.min().date()} → {df.index.max().date()}  ·  "
-               f"src: {data_source_label()}")
-    st.divider()
-
-    page = st.radio("SECTION", PAGES, index=0, key="nav_page")
-    st.divider()
-
-    range_preset = st.radio("LOOKBACK", ["6M", "1Y", "3Y", "5Y", "10Y", "Max", "Custom"],
-                            index=2, key="lookback_preset")
-    end_date = df.index.max()
-    if range_preset == "6M":
-        start_date = end_date - pd.DateOffset(months=6)
-    elif range_preset == "1Y":
-        start_date = end_date - pd.DateOffset(years=1)
-    elif range_preset == "3Y":
-        start_date = end_date - pd.DateOffset(years=3)
-    elif range_preset == "5Y":
-        start_date = end_date - pd.DateOffset(years=5)
-    elif range_preset == "10Y":
-        start_date = end_date - pd.DateOffset(years=10)
-    elif range_preset == "Max":
-        start_date = df.index.min()
-    else:
-        custom = st.date_input("Range",
-                               value=(end_date - pd.DateOffset(years=3), end_date),
-                               min_value=df.index.min().date(),
-                               max_value=df.index.max().date())
-        if isinstance(custom, tuple) and len(custom) == 2:
-            start_date, end_date = pd.Timestamp(custom[0]), pd.Timestamp(custom[1])
-        else:
-            start_date = end_date - pd.DateOffset(years=3)
-
-    # Live liquidity read-out in the sidebar, always visible.
-    if not pd.isna(index_result.latest):
-        reg = index_result.latest_regime
-        reg_colour = REGIME_COLORS.get(reg, TEXT_DIM)
-        st.divider()
-        st.markdown(
-            f"""
-            <div style="font-size:10px;color:#888;letter-spacing:0.1em;
-                        text-transform:uppercase;">Liquidity now</div>
-            <div style="font-size:26px;font-weight:700;color:{reg_colour};
-                        line-height:1.1;">{index_result.latest:.1f}</div>
-            <div style="font-size:11px;color:{reg_colour};font-weight:700;
-                        text-transform:uppercase;letter-spacing:0.06em;">{reg}</div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-dff = date_filter(df, start_date, end_date)
-
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-st.markdown(
-    f"""
-    <div style="padding:0 0 1rem 0;border-bottom:1px solid #1a1a1a;margin-bottom:1rem;">
-      <div style="font-size:24px;font-weight:700;letter-spacing:0.06em;color:#fff;
-                  text-transform:uppercase;">Rates &amp; Liquidity Monitor</div>
-      <div style="font-size:10px;color:#888;letter-spacing:0.1em;text-transform:uppercase;
-                  margin-top:4px;">
-        Latest: <span style="color:#ccc;font-weight:700;">
-        {df.index.max().strftime('%b %d, %Y').upper()}</span> &nbsp;·&nbsp;
-        Viewing: {start_date.strftime('%b %Y').upper()} →
-        {end_date.strftime('%b %Y').upper()} &nbsp;·&nbsp; {len(dff):,} obs
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------------------------------------------------------------------
-# Routing
-# ---------------------------------------------------------------------------
-if page == PAGES[0]:
-    # Homepage: high-level liquidity summary panel first (requirement #12).
-    render_summary_panel(index_result)
-    st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
-    render_index_page(df, dff, index_result)
-elif page == PAGES[1]:
-    render_money_market(dff)
-elif page == PAGES[2]:
-    render_xccy(dff)
-elif page == PAGES[3]:
-    render_credit(dff)
-elif page == PAGES[4]:
-    render_rates_page(df, dff)
-elif page == PAGES[5]:
-    render_inflation_page(df, dff)
-elif page == PAGES[6]:
-    render_data_quality_page(df)
