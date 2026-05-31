@@ -76,9 +76,12 @@ The sidebar switches between seven sections (and shows the live liquidity read-o
 
 ---
 
-## The Composite Liquidity Index — methodology
+## The Composite Liquidity Index — methodology (v0.3)
 
 **Reading it:** higher = looser, **50 = neutral**, ≥60 Loose, <45 Tight, <35 Stress.
+The live methodology version, parameters, data hash, and coverage are shown in the
+**Methodology & audit trail** panel on the index page (single source of truth:
+`index/methodology.py::INDEX_METHODOLOGY`).
 
 It is built from *raw* indicators — Bloomberg FCI and Chicago Fed NFCI are used
 **only as benchmarks**, never as inputs.
@@ -94,51 +97,67 @@ It is built from *raw* indicators — Bloomberg FCI and Chicago Fed NFCI are use
 | Market liquidity / vol | 10% | UST liquidity index, swap spread, (MOVE, VIX if present) |
 
 **2. Direction adjustment.** Each indicator is multiplied by ±1 *before*
-z-scoring so that **higher always means looser** (e.g. HY OAS gets −1: a wider
-spread is tighter; reserves get +1). This single rule makes the whole index
-interpretable.
+z-scoring so that **higher always means looser** (e.g. HY OAS gets −1; reserves +1).
 
 **3. Z-scoring.** Each adjusted indicator becomes a rolling z-score —
 `window = 1260` (~5y), `min_periods = 504` (~2y), clipped to `[-3, 3]`. A
-**low-variation guard** sets the z-score to NaN whenever the trailing window
-holds fewer than 20 distinct values, so a near-flat series (the classic example
-is EFFR−IORB before 2019, which sat in a ~2bp range) can no longer turn a
-trivial 1bp move into a fake ±3σ "spike". Weekly series (Fed reserves/repo) get
-a **capped forward-fill** so a stale value can't masquerade as a live daily print.
+**low-variation guard** sets the z to NaN whenever the trailing window holds fewer
+than 20 distinct values, so a near-flat series (e.g. EFFR−IORB before 2019) can't
+turn a 1bp move into a fake ±3σ spike. The whole index runs on a **business-day
+grid**, so stray weekend prints in the raw feed can't create inconsistent coverage.
 
-**4. Sub-index & composite.** Each bucket's sub-index is the mean of its
-component z-scores, but a bucket only counts on days it has **≥2 live
-components** — a single fragile series is never allowed to *be* a whole bucket.
-The composite is the weighted average over qualifying buckets; weights
-renormalise across whichever buckets have data, and those **effective weights are
-charted over time** so the concentration is transparent.
+**3a. Weekly / low-frequency series (new in v0.3).** Fed reserves and repo are
+reported **weekly on Wednesdays** but arrive as daily-repeated values in
+`DATA.xlsx`. Treating every repeated row as a fresh print deflates their variance
+and defeats the forward-fill cap. Instead each component carries metadata
+(`frequency`, `max_ffill_days`, `observation_mode`) and weekly series use
+`observation_mode = "weekday"`: the z-score is computed on the **true Wednesday
+observations** (over a frequency-appropriate ~5y window of weekly prints) and then
+the **z-score** — not the raw value — is forward-filled onto the daily grid for at
+most `max_ffill_days` (10) business days. Beyond that the component goes
+not-live until the next real observation, so a frozen weekly value can't stay live
+forever. (`change_dates` compression is available only as a fallback; it would
+wrongly drop legitimately-unchanged weeks, so it is not the default.) The
+**Forward-Fill Audit** table reports, per component, the latest true observation,
+days since, live/stale status with reason, and the % of the last year that was
+forward-filled (~80% for weekly series, as expected).
+
+**4. Sub-index & composite.** Each bucket's sub-index is the mean of its live
+component z-scores, but a bucket only counts on days it has **≥2 live components**.
+The composite is the weighted average over qualifying buckets; weights renormalise
+across whichever buckets have data, and the **effective weights are charted** so
+concentration is transparent.
 
 **5. Scaling.** `liquidity_index = 50 + 10 × composite_z`.
 
-**6. Coverage gate (when the index is reliable).** A date is only **published**
-if it has **≥3 qualifying buckets** and **≥8 contributing components**, and is
-past the rolling-z warm-up (126 business days after the first computable date).
-Dates that fail are set to NaN — not plotted — and the page labels the early
-span as a *low-coverage / warm-up period*. With the current data this means the
-index is **computable from 2016-05-18 but only reliable/published from
-2019-08-18**, the point at which the SOFR money-market plumbing (SOFR/TGCR/BGCR
-spreads) begins and a third well-populated bucket exists. Before that, the index
-ran on too few components concentrated in single-component buckets, which is what
-produced the 2016–2018 oscillations in the old benchmark overlay.
+**6. Coverage gate.** A date is **published** only with **≥3 qualifying buckets**
+and **≥8 contributing components**, past the rolling-z warm-up (126 business days).
+With the current data the index is computable from 2016 but reliable/published from
+**2019-08-19**, when the SOFR plumbing begins and a third well-populated bucket
+exists. (Earlier dates are NaN, which is what removed the 2016–2018 oscillations.)
 
-**7. Contribution decomposition.** Each bucket's contribution is built so the
-terms sum *exactly* to `index − 50`, and so each bucket's change over any
-horizon sums exactly to the index change. That's what powers the "why is
-liquidity moving" attribution on the homepage — a positive contribution eased
-liquidity, a negative one tightened it.
+**7. Contribution decomposition (bucket and component).** Bucket contributions sum
+*exactly* to `index − 50`; **component** contributions also sum to `index − 50` via
+`contribution_i = 10 · effective_weight_b · z_i / n_live_in_bucket_b`. Both level
+and 1w/1m/3m change contributions reconcile to the published index change. The
+**Component Contributions** section ranks the top easing/tightening drivers and
+lists every excluded component with a reason (Missing data / Stale (capped
+forward-fill) / Failed low-unique-observation guard / Bucket has <2 live components
+/ Coverage gate / Insufficient rolling history).
 
-**8. Validation.** The index is compared against Bloomberg FCI / Chicago Fed
-NFCI via a correlation table, rolling 1y correlation, a crisis-window check
-(Sep-2019 repo, COVID, 2022 QT, Mar-2023 banks — the index correctly dips into
-Tight/Stress in each), and a lead-lag cross-correlation. The benchmark overlay
-standardises over the published window only, and offers a Raw/Smoothed toggle
-(smoothing is visual-only and never feeds the index). Run
-`python scripts/diagnose_spikes.py` to reproduce the coverage/spike diagnostic.
+**8. Methodology versioning & reconciliation (new in v0.3).** The index carries a
+formal version. The **Index Methodology Reconciliation** section recomputes a
+**legacy** index (no coverage gate, no min-2-per-bucket, no low-unique guard,
+unlimited forward-fill, daily treatment of weekly data) on the *same* latest data
+and shows the legacy-vs-current difference per bucket — so you can tell whether a
+headline move came from **market data** or from **methodology**. The reconciliation
+identities (`Σ current contribs = current−50`, `Σ legacy = legacy−50`,
+`Σ diffs = current − legacy`) are asserted in the smoke test.
+
+**9. Validation.** Correlation table, rolling 1y correlation, crisis-window check
+(Sep-2019 repo, COVID, 2022 QT, Mar-2023 banks), and a lead-lag cross-correlation.
+Run `python scripts/diagnose_spikes.py` for the coverage/spike diagnostic and
+`python smoke_test.py` for the full reconciliation/audit checks.
 
 ---
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 import pandas as pd
 
 from data.loader import get_series
+from config.tickers import TICKERS
 
 # ---------------------------------------------------------------------------
 # Buckets: label, first-version weight, sort order
@@ -114,6 +115,48 @@ def max_ffill_of(comp_id: str) -> int:
     return MAX_FFILL_BY_FREQ.get(frequency_of(comp_id), 5)
 
 
+# Observation mode controls how a daily-dense column is reduced to its genuine
+# observations before z-scoring (requirement #4). Fed reserves/repo are reported
+# weekly on Wednesdays even though the Bloomberg pull repeats the value daily, so
+# we treat Wednesday as the true observation. Default for everything else is
+# "daily" (every row is a real print).
+OBSERVATION_MODE: dict[str, str] = {
+    "cb_reserves": "weekday",
+    "cb_repo":     "weekday",
+}
+OBSERVATION_WEEKDAY: dict[str, int] = {  # Monday=0 ... Sunday=6
+    "cb_reserves": 2,   # Wednesday
+    "cb_repo":     2,   # Wednesday
+}
+
+
+def observation_mode_of(comp_id: str) -> str:
+    return OBSERVATION_MODE.get(comp_id, "daily")
+
+
+def observation_weekday_of(comp_id: str) -> int | None:
+    return OBSERVATION_WEEKDAY.get(comp_id)
+
+
+# Map each component to its underlying Bloomberg ticker(s) for audit tables.
+_SPEC_OF = {cid: spec for cid, _, _, _, spec in COMPONENTS}
+
+
+def component_ticker(comp_id: str) -> str:
+    """Human-readable Bloomberg ticker(s) behind a component's builder spec."""
+    spec = _SPEC_OF.get(comp_id)
+    if not spec:
+        return ""
+    kind = spec[0]
+    if kind == "ticker":
+        return TICKERS.get(spec[1], spec[1])
+    if kind in ("spread", "mtg_spread"):
+        return f"{TICKERS.get(spec[1], spec[1])} − {TICKERS.get(spec[2], spec[2])}"
+    if kind == "mean":
+        return " · ".join(TICKERS.get(k, k) for k in spec[1])
+    return ""
+
+
 def _build_raw(df: pd.DataFrame, spec: tuple) -> pd.Series:
     """Resolve a builder spec into a raw (un-adjusted) series."""
     kind = spec[0]
@@ -173,6 +216,8 @@ def build_components(df: pd.DataFrame) -> tuple[dict[str, pd.Series], pd.DataFra
                 "n_obs": int(series.shape[0]),
                 "frequency": frequency_of(comp_id),
                 "max_ffill": max_ffill_of(comp_id),
+                "observation_mode": observation_mode_of(comp_id),
+                "ticker": component_ticker(comp_id),
             }
         )
     meta = pd.DataFrame(meta_rows)

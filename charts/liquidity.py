@@ -450,13 +450,34 @@ def _smooth(s: pd.Series, window: int) -> pd.Series:
 # ===========================================================================
 # Full page renderer (requirement #9-#11)
 # ===========================================================================
-def render_index_page(df: pd.DataFrame, dff: pd.DataFrame, result: IndexResult) -> None:
+def render_index_page(df: pd.DataFrame, dff: pd.DataFrame, result: IndexResult,
+                      audit: dict | None = None,
+                      export_bytes: bytes | None = None,
+                      export_name: str | None = None) -> None:
     """Render the entire Composite Liquidity Index section."""
+    audit = audit or {}
     section_header(
         "Composite Liquidity Index",
         "Raw-indicator liquidity gauge · higher = looser · 50 = neutral · "
         "z-scored & weighted across five buckets",
     )
+
+    # Excel export — one click, full multi-sheet workbook.
+    if export_bytes:
+        _, btn_col = st.columns([6, 2])
+        with btn_col:
+            st.download_button(
+                label="⬇  Export to Excel",
+                data=export_bytes,
+                file_name=export_name or "liquidity_index.xlsx",
+                mime="application/vnd.openxmlformats-officedocument."
+                     "spreadsheetml.sheet",
+                help="Multi-sheet workbook: index series, bucket & component "
+                     "contributions, latest snapshot, legacy reconciliation, "
+                     "forward-fill audit, and methodology / audit trail.",
+                use_container_width=True,
+                key="liq_export_xlsx",
+            )
 
     if result.index.dropna().empty:
         st.warning(
@@ -527,7 +548,10 @@ def render_index_page(df: pd.DataFrame, dff: pd.DataFrame, result: IndexResult) 
 
     # --- Component availability + methodology -----------------------------
     _render_components_table(result)
-    _render_methodology(result)
+    _render_component_contributions(audit.get("components"))
+    _render_reconciliation(audit.get("reconciliation"))
+    _render_ffill_audit(audit.get("ffill_audit"))
+    _render_methodology_audit(result, audit.get("methodology"))
 
 
 def _render_coverage_block(result: IndexResult) -> None:
@@ -776,39 +800,218 @@ def _render_components_table(result: IndexResult) -> None:
         "forward-fill-capped so a stale value can't masquerade as a live daily print.")
 
 
-def _render_methodology(result: IndexResult) -> None:
-    """Plain-maths explanation block (requirement #9)."""
-    with st.expander("Methodology — how the index is calculated", expanded=False):
+def _contrib_table_style(df_disp: pd.DataFrame):
+    """Shared dataframe formatting for component tables."""
+    return df_disp.style.format({
+        "Raw": "{:,.4g}", "Adjusted": "{:,.4g}", "Z": "{:+.2f}",
+        "Eff wt": "{:.0%}", "Contribution": "{:+.3f}",
+        "1w Δ": "{:+.3f}", "1m Δ": "{:+.3f}", "3m Δ": "{:+.3f}",
+    })
+
+
+def _component_disp(rows: pd.DataFrame) -> pd.DataFrame:
+    cols = ["component", "name", "ticker", "bucket", "raw_latest", "adjusted_latest",
+            "z", "eff_weight", "contribution", "chg_1w", "chg_1m", "chg_3m", "status"]
+    out = rows[cols].rename(columns={
+        "component": "ID", "name": "Component", "ticker": "Ticker", "bucket": "Bucket",
+        "raw_latest": "Raw", "adjusted_latest": "Adjusted", "z": "Z",
+        "eff_weight": "Eff wt", "contribution": "Contribution",
+        "chg_1w": "1w Δ", "chg_1m": "1m Δ", "chg_3m": "3m Δ", "status": "Status"})
+    return out
+
+
+def _render_component_contributions(ct: pd.DataFrame | None) -> None:
+    """Component-level explainability (requirement #3)."""
+    if ct is None or ct.empty:
+        return
+    st.markdown(
+        "<div style='border-top:1px solid #1a1a1a;margin-top:1rem;padding-top:0.6rem;'>"
+        "<div style='font-size:14px;font-weight:700;letter-spacing:0.06em;color:#fff;"
+        "text-transform:uppercase;'>Component contributions</div>"
+        "<div style='font-size:10px;color:#888;letter-spacing:0.08em;"
+        "text-transform:uppercase;margin-top:2px;'>Exactly which market variables "
+        "drive the signal · live contributions sum to index − 50</div></div>",
+        unsafe_allow_html=True,
+    )
+    live = ct[ct["live"]].copy()
+    total = live["contribution"].sum()
+    st.caption(f"{len(live)} live components · Σ contributions = {total:+.3f} = index − 50.")
+
+    view = st.radio(
+        "VIEW", ["Current level", "1-week change", "1-month change", "3-month change"],
+        index=0, horizontal=True, key="liq_compcontrib_view")
+    sort_col = {"Current level": "contribution", "1-week change": "chg_1w",
+                "1-month change": "chg_1m", "3-month change": "chg_3m"}[view]
+
+    ranked = live.dropna(subset=[sort_col])
+    easing = ranked.nlargest(10, sort_col)
+    tightening = ranked.nsmallest(10, sort_col)
+    e_col, t_col = st.columns(2, gap="medium")
+    with e_col:
+        st.markdown("<div style='color:#3fb37f;font-size:11px;letter-spacing:0.08em;"
+                    "text-transform:uppercase;margin:0.3rem 0 0.2rem;'>Top 10 easing "
+                    "(pushes index up)</div>", unsafe_allow_html=True)
+        st.dataframe(_contrib_table_style(_component_disp(easing)),
+                     hide_index=True, use_container_width=True)
+    with t_col:
+        st.markdown("<div style='color:#e0564a;font-size:11px;letter-spacing:0.08em;"
+                    "text-transform:uppercase;margin:0.3rem 0 0.2rem;'>Top 10 tightening "
+                    "(pushes index down)</div>", unsafe_allow_html=True)
+        st.dataframe(_contrib_table_style(_component_disp(tightening)),
+                     hide_index=True, use_container_width=True)
+
+    excluded = ct[~ct["live"]]
+    if not excluded.empty:
+        st.markdown("<div style='color:#888;font-size:11px;letter-spacing:0.08em;"
+                    "text-transform:uppercase;margin:0.5rem 0 0.2rem;'>Excluded "
+                    "components &amp; reason</div>", unsafe_allow_html=True)
+        st.dataframe(
+            excluded[["component", "name", "bucket", "status"]].rename(columns={
+                "component": "ID", "name": "Component", "bucket": "Bucket",
+                "status": "Reason excluded"}),
+            hide_index=True, use_container_width=True)
+
+
+def _render_reconciliation(rec: dict | None) -> None:
+    """Legacy vs current methodology reconciliation (requirement #2)."""
+    if not rec:
+        return
+    st.markdown(
+        "<div style='border-top:1px solid #1a1a1a;margin-top:1rem;padding-top:0.6rem;'>"
+        "<div style='font-size:14px;font-weight:700;letter-spacing:0.06em;color:#fff;"
+        "text-transform:uppercase;'>Index methodology reconciliation</div>"
+        "<div style='font-size:10px;color:#888;letter-spacing:0.08em;"
+        "text-transform:uppercase;margin-top:2px;'>Legacy vs current rules on the "
+        "same latest data — isolates the methodology effect</div></div>",
+        unsafe_allow_html=True,
+    )
+    d = rec["date"].date()
+    diff = rec["index_diff"]
+    col = POS_GREEN if diff >= 0 else NEG_RED
+    st.markdown(
+        f"""
+        <div style="background:#0f0f0f;border:1px solid #1a1a1a;border-radius:6px;
+                    padding:0.7rem 0.9rem;margin:0.3rem 0 0.6rem;font-size:13px;
+                    color:#ccc;line-height:1.8;">
+          On <b>{d}</b>: legacy methodology = <b>{rec['legacy_index']:.2f}</b>,
+          current (v0.3) = <b>{rec['current_index']:.2f}</b>,
+          difference = <b style="color:{col};">{diff:+.2f}</b> index points
+          (composite-z {rec['legacy_z']:.3f} → {rec['current_z']:.3f},
+          Δ {rec['z_diff']:+.3f}). This is the change attributable to
+          <b>methodology only</b> — market-data effects are separate.
+        </div>
+        """,
+        unsafe_allow_html=True)
+
+    tab = rec["table"].copy()
+    disp = tab[["bucket_label", "legacy_sub", "current_sub", "legacy_eff_w",
+                "current_eff_w", "legacy_contrib", "current_contrib", "contrib_diff"]]
+    disp = disp.rename(columns={
+        "bucket_label": "Bucket", "legacy_sub": "Legacy sub", "current_sub": "Current sub",
+        "legacy_eff_w": "Legacy wt", "current_eff_w": "Current wt",
+        "legacy_contrib": "Legacy contrib", "current_contrib": "Current contrib",
+        "contrib_diff": "Δ contrib"})
+    st.dataframe(
+        disp.style.format({
+            "Legacy sub": "{:+.3f}", "Current sub": "{:+.3f}",
+            "Legacy wt": "{:.0%}", "Current wt": "{:.0%}",
+            "Legacy contrib": "{:+.3f}", "Current contrib": "{:+.3f}",
+            "Δ contrib": "{:+.3f}"}),
+        hide_index=True, use_container_width=True)
+
+    c = rec["checks"]
+    ok = (abs(c["sum_current_contrib"] - c["current_index_minus_50"]) < 1e-6 and
+          abs(c["sum_legacy_contrib"] - c["legacy_index_minus_50"]) < 1e-6 and
+          abs(c["sum_contrib_diff"] - c["current_minus_legacy"]) < 1e-6)
+    mark = "✓ reconciles" if ok else "✗ mismatch"
+    st.caption(
+        f"Σ current contribs {c['sum_current_contrib']:+.3f} = index−50 "
+        f"{c['current_index_minus_50']:+.3f} · Σ legacy {c['sum_legacy_contrib']:+.3f} "
+        f"= {c['legacy_index_minus_50']:+.3f} · Σ Δ {c['sum_contrib_diff']:+.3f} "
+        f"= current−legacy {c['current_minus_legacy']:+.3f}  ({mark}).")
+
+
+def _render_ffill_audit(ffa: pd.DataFrame | None) -> None:
+    """Forward-fill / staleness audit (requirement #5)."""
+    if ffa is None or ffa.empty:
+        return
+    with st.expander("Forward-fill audit — weekly / low-frequency freshness", expanded=False):
+        disp = ffa.rename(columns={
+            "component": "ID", "name": "Component", "frequency": "Freq",
+            "max_ffill_days": "Max ffill", "latest_raw_obs": "Latest raw",
+            "latest_true_obs": "Latest true obs", "days_since_true_obs": "Days since",
+            "is_live": "Live", "reason": "Reason", "stale_days_1y": "Stale days (1y)",
+            "pct_ffilled_1y": "% ffilled (1y)"})
+        st.dataframe(
+            disp.style.format({"% ffilled (1y)": "{:.0f}%"}),
+            hide_index=True, use_container_width=True,
+            height=min(560, 42 + 34 * len(disp)))
+        st.caption(
+            "Weekly series (Fed reserves/repo) are observed on Wednesdays; the z is "
+            "computed on those true observations and forward-filled at most "
+            "'Max ffill' business days. '% ffilled' near 80% for weekly series is "
+            "expected (4 of 5 weekdays are fills); a component goes not-live once "
+            "'Days since' exceeds 'Max ffill'.")
+
+
+def _render_methodology_audit(result: IndexResult, audit: dict | None) -> None:
+    """Methodology version, parameters, audit trail, and the math (req #1, #9)."""
+    with st.expander("Methodology & audit trail", expanded=False):
+        if audit:
+            ver = audit.get("version", "?")
+            st.markdown(
+                f"<div style='font-size:13px;color:#fff;'>Composite Liquidity Index "
+                f"Methodology Version: <b>{ver}</b></div>"
+                f"<div style='font-size:11px;color:#888;margin-bottom:8px;'>"
+                f"{audit.get('description','')}</div>", unsafe_allow_html=True)
+            bw = audit.get("bucket_weights", {})
+            params = {
+                "Methodology version": ver,
+                "Z-score window": audit.get("z_window"),
+                "Minimum periods": audit.get("z_min_periods"),
+                "Z-score clip": f"±{audit.get('z_clip')}",
+                "Min unique observations": audit.get("z_min_unique"),
+                "Min available buckets": audit.get("min_available_buckets"),
+                "Min available components": audit.get("min_available_components"),
+                "Min components per bucket": audit.get("min_components_per_bucket"),
+                "Warm-up (business days)": audit.get("warmup_days_after_first_valid"),
+                "Bucket weights": ", ".join(f"{BUCKETS[b]['label']} {w:.0%}"
+                                            for b, w in bw.items()),
+                "Latest DATA.xlsx hash": str(audit.get("data_hash"))[:16] + "…",
+                "Latest data date": str(getattr(audit.get("latest_data_date"), "date",
+                                                 lambda: audit.get("latest_data_date"))()),
+                "Latest published date": str(getattr(audit.get("latest_published_date"),
+                                             "date", lambda: "n/a")()),
+                "Reliable from": str(getattr(audit.get("first_published_date"),
+                                     "date", lambda: "n/a")()),
+                "Components on latest date": audit.get("components_on_latest"),
+                "Buckets on latest date": audit.get("buckets_on_latest"),
+                "Latest index": f"{audit.get('latest_index'):.2f} "
+                                f"({audit.get('latest_regime')})",
+            }
+            pdf = pd.DataFrame({"Parameter": list(params.keys()),
+                                "Value": [str(v) for v in params.values()]})
+            st.dataframe(pdf, hide_index=True, use_container_width=True,
+                         height=min(640, 42 + 34 * len(pdf)))
+            st.caption(
+                "If the headline value changes after a methodology update, the "
+                "version bump + the reconciliation table above tell you whether the "
+                "move came from market data or from methodology.")
+
         st.markdown(
             r"""
-**1. Direction adjustment** — each raw indicator is signed so higher = looser:
-$\;\text{adj}_{i,t} = \text{raw}_{i,t}\times \text{direction}_i$.
-
-**2. Rolling z-score** (per indicator):
-$\;z_{i,t} = \dfrac{\text{adj}_{i,t}-\mu_{i,t}}{\sigma_{i,t}}$, where $\mu,\sigma$
-are the trailing **5y** mean/std (min **2y**), clipped to $[-3,3]$. A
-**low-variation guard** sets $z$ to NaN when the trailing window holds too few
-distinct values, so a near-flat series (e.g. EFFR−IORB pre-2019) can't produce
-fake ±3σ spikes.
-
-**3. Bucket sub-index** — average of the available z-scores in the bucket,
-*only* on days the bucket has at least 2 live components:
-$\;\text{bucket}_{b,t} = \operatorname{mean}_i\{z_{i,t}: i\in b\}$.
-
-**4. Weighted composite** — renormalised over the buckets available that day:
-$\;\text{composite}_t = \sum_b \tilde{w}_{b,t}\,\text{bucket}_{b,t}$,
-with $\sum_b \tilde{w}_{b,t}=1$ (effective weights shown above).
-
-**5. Final index** — $\;\text{liquidity}_t = 50 + 10\times\text{composite}_t$.
-
-**6. Coverage gate** — a date is published only with ≥ 3 qualifying buckets and
-≥ 8 contributing components, past the rolling-z warm-up; otherwise it is NaN.
-
-**Interpretation** — 50 = neutral · >50 looser than normal · <50 tighter ·
-≥ 60 loose · ≤ 40 tight · ≤ 30 stress.
-
-**Benchmarks** — Bloomberg US FCI and Chicago Fed NFCI are **never inputs**;
-they are used only to validate the index (correlation, crisis behaviour,
-lead-lag).
+**The math.**
+**1. Direction** — $\text{adj}_{i,t} = \text{raw}_{i,t}\times \text{dir}_i$ (higher = looser).
+**2. Rolling z** — $z_{i,t} = (\text{adj}_{i,t}-\mu_{i,t})/\sigma_{i,t}$, trailing 5y
+(min 2y), clipped $[-3,3]$; NaN if the window holds < 20 distinct values
+(low-variation guard). Weekly series are z-scored on their true (Wednesday)
+observations and the z is forward-filled ≤ 10 business days.
+**3. Bucket sub-index** — mean of live z's, only if the bucket has ≥ 2 live components.
+**4. Composite** — $\sum_b \tilde w_{b,t}\,\text{bucket}_{b,t}$, weights renormalised over
+qualifying buckets.
+**5. Index** — $50 + 10\times\text{composite}$.
+**6. Component contribution** — $10\,\tilde w_{b,t}\,z_{i,t}/n_{b,t}$, summing to index−50.
+**7. Coverage gate** — published only with ≥ 3 buckets, ≥ 8 components, past warm-up.
+**Benchmarks** (Bloomberg FCI, Chicago Fed NFCI) are validation only, never inputs.
             """
         )

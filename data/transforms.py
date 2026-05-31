@@ -97,6 +97,67 @@ def rolling_zscore(
     return z.clip(-clip, clip)
 
 
+# Per-frequency rolling window/min-periods in *observation* units, so a weekly
+# series is judged over ~5y of weekly prints (not 1260 weeks). Keeps the
+# "5-year regime" interpretation consistent across frequencies.
+OBS_WINDOW_BY_FREQ = {
+    "daily":     (1260, 504),
+    "weekly":    (260, 104),
+    "monthly":   (60, 24),
+    "irregular": (60, 24),
+}
+
+
+def true_observations(s: pd.Series, mode: str, weekday: int | None = None) -> pd.Series:
+    """Reduce a daily-dense series to its genuine observation dates.
+
+    mode = "weekday"     : keep only the official observation weekday (e.g. Fed
+                           H.4.1 reserves are Wednesday-dated) — safe even when
+                           the value legitimately repeats week to week.
+    mode = "change_dates": keep only rows where the value changed — a fallback
+                           when the observation calendar is unknown (can wrongly
+                           drop genuinely-unchanged prints, so not the default).
+    mode = "daily"/other : every row is a real observation.
+    """
+    s = s.sort_index().dropna()
+    if s.empty:
+        return s
+    if mode == "weekday" and weekday is not None:
+        return s[s.index.weekday == weekday]
+    if mode == "change_dates":
+        keep = s.ne(s.shift())
+        keep.iloc[0] = True
+        return s[keep]
+    return s
+
+
+def lowfreq_zscore(
+    adjusted_daily: pd.Series,
+    daily_index: pd.Index,
+    mode: str,
+    weekday: int | None,
+    window: int,
+    min_periods: int,
+    clip: float = Z_CLIP,
+    min_unique: int | None = Z_MIN_UNIQUE,
+    max_ffill: int | None = 10,
+) -> pd.Series:
+    """Z-score a weekly/low-frequency series on its TRUE observations, then map
+    back to the daily grid by forward-filling the *z-score* (not the raw value)
+    for at most ``max_ffill`` business days. Beyond that the component goes stale
+    (NaN) until the next real observation — so a frozen weekly print can't stay
+    live forever, and repeated daily values never count as fresh observations.
+    """
+    obs = true_observations(adjusted_daily, mode, weekday)
+    if obs.empty:
+        return pd.Series(index=daily_index, dtype=float)
+    z_obs = rolling_zscore(obs, window=window, min_periods=min_periods,
+                           clip=clip, min_unique=min_unique, max_ffill=None)
+    grid = daily_index.union(z_obs.index)
+    z_daily = z_obs.reindex(grid).sort_index().ffill(limit=max_ffill)
+    return z_daily.reindex(daily_index)
+
+
 def align_frame(series_map: dict[str, pd.Series], max_ffill: int | None = DEFAULT_MAX_FFILL) -> pd.DataFrame:
     """Combine named series into one daily-frequency frame, capped-forward-filled.
 

@@ -32,10 +32,12 @@ import numpy as np
 import pandas as pd
 
 from data.transforms import (
-    rolling_zscore, Z_WINDOW, Z_MIN_PERIODS, Z_CLIP, Z_MIN_UNIQUE,
+    rolling_zscore, lowfreq_zscore, OBS_WINDOW_BY_FREQ,
+    Z_WINDOW, Z_MIN_PERIODS, Z_CLIP, Z_MIN_UNIQUE,
 )
 from index.components import (
     BUCKETS, DIRECTION, BUCKET_OF, build_components, max_ffill_of,
+    frequency_of, observation_mode_of, observation_weekday_of,
 )
 
 # Index scaling
@@ -79,6 +81,7 @@ class IndexResult:
     sub_indices: pd.DataFrame    # date x bucket sub-index z-scores (min_per_bucket applied)
     z_scores: pd.DataFrame       # date x component direction-adjusted z-scores
     bucket_terms: pd.DataFrame   # date x bucket additive contributions to (raw_index-50)
+    component_terms: pd.DataFrame  # date x component additive contributions to (raw_index-50)
     weights: pd.Series           # base bucket weights (normalised over buckets seen)
     effective_weights: pd.DataFrame  # date x bucket renormalised weights actually used
     components_by_bucket: pd.DataFrame  # date x bucket live-component counts
@@ -106,13 +109,22 @@ class IndexResult:
             out[name] = float(s.iloc[-1] - s.iloc[-1 - n]) if len(s) > n else float("nan")
         return out
 
+    def _terms_on_published(self, terms: pd.DataFrame) -> pd.DataFrame:
+        """Restrict a terms frame to the published index dates, so contribution
+        differences reconcile exactly to the published index changes regardless of
+        any unpublished/low-frequency rows elsewhere in the frame."""
+        if terms is None or terms.empty:
+            return pd.DataFrame()
+        pub = self.index.dropna().index
+        return terms.reindex(pub)
+
     def level_contributions(self) -> pd.Series:
-        terms = self.bucket_terms.dropna(how="all")
+        terms = self._terms_on_published(self.bucket_terms).dropna(how="all")
         return terms.iloc[-1] if len(terms) else pd.Series(dtype=float)
 
     def change_contributions(self, horizon: str = "1m") -> pd.Series:
         n = HORIZONS[horizon]
-        terms = self.bucket_terms.dropna(how="all")
+        terms = self._terms_on_published(self.bucket_terms).dropna(how="all")
         if len(terms) <= n:
             return pd.Series(dtype=float)
         return terms.iloc[-1] - terms.iloc[-1 - n]
@@ -132,6 +144,19 @@ class IndexResult:
             "buckets": self.available_bucket_count,
         })
 
+    def component_level_contributions(self) -> pd.Series:
+        """Latest contribution of each component to (index - 50), index points."""
+        terms = self._terms_on_published(self.component_terms).dropna(how="all")
+        return terms.iloc[-1] if len(terms) else pd.Series(dtype=float)
+
+    def component_change_contributions(self, horizon: str = "1m") -> pd.Series:
+        """Each component's contribution to the index change over ``horizon``."""
+        n = HORIZONS[horizon]
+        terms = self._terms_on_published(self.component_terms).dropna(how="all")
+        if len(terms) <= n:
+            return pd.Series(dtype=float)
+        return terms.iloc[-1] - terms.iloc[-1 - n]
+
 
 def compute_index(
     df: pd.DataFrame,
@@ -144,28 +169,60 @@ def compute_index(
     min_buckets: int = MIN_AVAILABLE_BUCKETS,
     min_components: int = MIN_AVAILABLE_COMPONENTS,
     warmup_days: int = WARMUP_DAYS_AFTER_FIRST_VALID,
+    lowfreq_handling: bool = True,
+    ffill_cap: str = "by_freq",
 ) -> IndexResult:
-    """Build the Composite Liquidity Index from the price panel."""
+    """Build the Composite Liquidity Index from the price panel.
+
+    ``lowfreq_handling`` (True) z-scores weekly/low-frequency components on their
+    true observations; set False to treat every daily row as a fresh print (the
+    legacy behaviour). ``ffill_cap`` is "by_freq" (per-component caps) or "none"
+    (unlimited forward-fill, legacy).
+    """
     # 1. Raw components + availability metadata.
     raw, meta = build_components(df)
 
-    # 2. Direction-adjust then z-score each available component, with a
-    #    per-component forward-fill cap based on its native frequency.
+    # 2. Direction-adjust then z-score each available component. Daily series use
+    #    a daily rolling window; weekly/low-frequency series are standardised on
+    #    their true observations (e.g. Wednesdays) and the z is forward-filled.
+    daily_grid = None
+    if raw:
+        lo = min(s.index.min() for s in raw.values())
+        hi = max(s.index.max() for s in raw.values())
+        daily_grid = pd.date_range(lo, hi, freq="B")
+    cap_daily = (lambda cid: max_ffill_of(cid)) if ffill_cap == "by_freq" else (lambda cid: None)
+
     z_cols: dict[str, pd.Series] = {}
     for comp_id, series in raw.items():
         adjusted = series * DIRECTION[comp_id]   # looser = higher
-        z_cols[comp_id] = rolling_zscore(
-            adjusted, window=z_window, min_periods=z_min_periods, clip=z_clip,
-            min_unique=z_min_unique, max_ffill=max_ffill_of(comp_id),
-        )
+        mode = observation_mode_of(comp_id)
+        if lowfreq_handling and mode != "daily":
+            win, minp = OBS_WINDOW_BY_FREQ.get(frequency_of(comp_id), (Z_WINDOW, Z_MIN_PERIODS))
+            z_cols[comp_id] = lowfreq_zscore(
+                adjusted, daily_grid, mode, observation_weekday_of(comp_id),
+                window=win, min_periods=minp, clip=z_clip, min_unique=z_min_unique,
+                max_ffill=max_ffill_of(comp_id),
+            )
+        else:
+            z_cols[comp_id] = rolling_zscore(
+                adjusted, window=z_window, min_periods=z_min_periods, clip=z_clip,
+                min_unique=z_min_unique, max_ffill=cap_daily(comp_id),
+            )
     z_scores = pd.DataFrame(z_cols).sort_index() if z_cols else pd.DataFrame()
+    # Pin the whole index to a business-day grid. Some raw Bloomberg series carry
+    # stray weekend timestamps; without this, daily components would get z-scores
+    # on Sat/Sun while weekly components (already on a B-day grid) are NaN there,
+    # giving inconsistent bucket coverage on weekends and breaking the change
+    # reconciliation (the row-counted "1w ago" could land on a weekend).
+    if not z_scores.empty and daily_grid is not None:
+        z_scores = z_scores.reindex(daily_grid)
 
     if z_scores.empty:
         empty = pd.Series(dtype=float)
         empty_df = pd.DataFrame()
         return IndexResult(empty, empty, empty, empty_df, z_scores, empty_df,
-                           pd.Series(dtype=float), empty_df, empty_df, empty,
-                           empty, empty, empty, meta)
+                           empty_df, pd.Series(dtype=float), empty_df, empty_df,
+                           empty, empty, empty, empty, meta)
 
     # 3. Per-bucket live-component counts and sub-index (with min_per_bucket).
     sub_data: dict[str, pd.Series] = {}
@@ -200,6 +257,18 @@ def compute_index(
     bucket_terms = INDEX_SCALE * sub_indices[w.index].mul(effective_weights)
     raw_index = INDEX_CENTER + bucket_terms.sum(axis=1, min_count=1)
     composite_z = (raw_index - INDEX_CENTER) / INDEX_SCALE
+
+    # Component-level additive terms (requirement #3):
+    #   term_i = 10 * eff_weight_b * z_i / n_live_in_bucket_b
+    # so terms sum within a bucket to bucket_term_b, and across all to raw_index-50.
+    comp_cols: dict[str, pd.Series] = {}
+    for comp_id in z_scores.columns:
+        b = BUCKET_OF[comp_id]
+        if b not in effective_weights.columns:
+            continue
+        n_live = components_by_bucket[b].replace(0, np.nan)
+        comp_cols[comp_id] = INDEX_SCALE * effective_weights[b] * z_scores[comp_id] / n_live
+    component_terms = pd.DataFrame(comp_cols).sort_index() if comp_cols else pd.DataFrame()
 
     # 5. Coverage diagnostics + publication gate.
     available_bucket_count = avail.sum(axis=1)
@@ -238,6 +307,7 @@ def compute_index(
         sub_indices=sub_indices,
         z_scores=z_scores,
         bucket_terms=bucket_terms,
+        component_terms=component_terms,
         weights=w,
         effective_weights=effective_weights,
         components_by_bucket=components_by_bucket,
