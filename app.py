@@ -53,7 +53,6 @@ from index.methodology import (
     compute_legacy_index, reconciliation, methodology_audit,
     component_contribution_table, forward_fill_audit,
 )
-from index.export import build_index_workbook, export_filename
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -138,14 +137,6 @@ def _build_audit(_source_hash: str):
         "components": component_contribution_table(cur, df_local),
         "ffill_audit": forward_fill_audit(cur, df_local),
     }
-
-
-@st.cache_data(show_spinner="Preparing Excel export...")
-def _build_export(_source_hash: str) -> bytes:
-    """Build the multi-sheet Excel workbook once per data version."""
-    df_local = load_data()
-    cur = _build_index(_source_hash)
-    return build_index_workbook(cur, _build_audit(_source_hash), df_local)
 
 
 index_result = _build_index(source_signature())
@@ -484,10 +475,7 @@ if page == PAGES[0]:
     # Homepage: high-level liquidity summary panel first (requirement #12).
     render_summary_panel(index_result)
     st.markdown("<div style='height:0.8rem;'></div>", unsafe_allow_html=True)
-    sig = source_signature()
-    render_index_page(df, dff, index_result, audit_bundle,
-                      export_bytes=_build_export(sig),
-                      export_name=export_filename(audit_bundle))
+    render_index_page(df, dff, index_result, audit_bundle)
 elif page == PAGES[1]:
     render_money_market(dff)
 elif page == PAGES[2]:

@@ -451,9 +451,7 @@ def _smooth(s: pd.Series, window: int) -> pd.Series:
 # Full page renderer (requirement #9-#11)
 # ===========================================================================
 def render_index_page(df: pd.DataFrame, dff: pd.DataFrame, result: IndexResult,
-                      audit: dict | None = None,
-                      export_bytes: bytes | None = None,
-                      export_name: str | None = None) -> None:
+                      audit: dict | None = None) -> None:
     """Render the entire Composite Liquidity Index section."""
     audit = audit or {}
     section_header(
@@ -461,23 +459,6 @@ def render_index_page(df: pd.DataFrame, dff: pd.DataFrame, result: IndexResult,
         "Raw-indicator liquidity gauge · higher = looser · 50 = neutral · "
         "z-scored & weighted across five buckets",
     )
-
-    # Excel export — one click, full multi-sheet workbook.
-    if export_bytes:
-        _, btn_col = st.columns([6, 2])
-        with btn_col:
-            st.download_button(
-                label="⬇  Export to Excel",
-                data=export_bytes,
-                file_name=export_name or "liquidity_index.xlsx",
-                mime="application/vnd.openxmlformats-officedocument."
-                     "spreadsheetml.sheet",
-                help="Multi-sheet workbook: index series, bucket & component "
-                     "contributions, latest snapshot, legacy reconciliation, "
-                     "forward-fill audit, and methodology / audit trail.",
-                use_container_width=True,
-                key="liq_export_xlsx",
-            )
 
     if result.index.dropna().empty:
         st.warning(
